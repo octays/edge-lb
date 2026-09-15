@@ -128,7 +128,7 @@ Array 的单元素固定查找与端口集合查找不是同一问题。Array �
 
 修正确性时不要未经评审更改所有算法语义。现有 `hash` 是兼容性语义，必须继续使用 skb hash 取模；一致性选择只能通过新增 `consistent_hash` 实现。先测不健康槽分布、并发 RR/LC、权重零/边界、目标增删；hash/persist 的稳定性包含数组排序和 hash 输入，不能假设不同主机的 skb hash 一定相同。已建流靠 flow 复用而非每包重新调度。
 
-2026-09-15 的 `consistent_hash` 高并发回归见 [high-concurrency-test-report-2026-09-11.md](high-concurrency-test-report-2026-09-11.md)：`concurrency=64`、`timeout=5000ms` 下 TCP 成功 CPS `8524.1`、默认 UDP socket 复用吞吐 `31377.7 req/s`，TCP/UDP 均 0 失败，active gateway 未记录 target miss、return miss 或 checksum error。默认 UDP 分布偏斜主要来自 `ha-bench` 复用 worker UDP socket，源端口样本有限；使用 `--udp-new-socket-per-request` 后去重源端口样本提升到 `55536`，UDP 分布约 `48.7% / 51.3%`，可用于判断真实多客户端源端口分布。
+2026-09-15 的 `consistent_hash` 高并发回归见 [high-concurrency-test-report-2026-09-11.md](high-concurrency-test-report-2026-09-11.md)：最终部署后 `concurrency=64`、`timeout=5000ms` 下 TCP 成功 CPS `8934.3`、默认 UDP socket 复用吞吐 `30959.5 req/s`，TCP 0 失败，UDP 54 次 timeout。active gateway 未记录 target miss、return miss、checksum error、bucket miss、unusable bucket 或 consistent-hash fallback。默认 UDP 分布偏斜主要来自 `ha-bench` 复用 worker UDP socket，源端口样本有限；使用 `--udp-new-socket-per-request` 后去重源端口样本提升到 `55536`，UDP 吞吐 `63951.5 req/s`，0 失败，分布约 `51.0% / 49.0%`，可用于判断真实多客户端源端口分布。
 
 健康目标索引、累积权重表可以在配置变化时构建，降低新建流扫描；只在目标数和 CPS 显示收益时实施。LC 的扫描成本只在新流发生，不能用它解释全部长连接 PPS。n2/n3 不纳入本轮。
 

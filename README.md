@@ -185,22 +185,24 @@ public addresses from the documentation. Full details are in
 | `concurrency=64`, `timeout=1000ms` | 8906.9 | 99.98% | 31204.1 req/s | 99.97% |
 | `concurrency=64`, `timeout=3000ms` | 8928.1 | 100.00% | 30856.4 req/s | 99.99% |
 | `concurrency=64`, `timeout=5000ms` | 8839.3 | 100.00% | 31658.8 req/s | 99.99% |
-| `consistent_hash`, `concurrency=64`, `timeout=5000ms` | 8524.1 | 100.00% | 31377.7 req/s | 100.00% |
-| `consistent_hash` UDP source-port sample, `concurrency=64`, `timeout=5000ms` | - | - | 59846.6 req/s | 100.00% |
+| `consistent_hash`, `concurrency=64`, `timeout=5000ms` | 8934.3 | 100.00% | 30959.5 req/s | 100.00% |
+| `consistent_hash` UDP source-port sample, `concurrency=64`, `timeout=5000ms` | - | - | 63951.5 req/s | 100.00% |
 
 The TCP test mode was `new-per-request`, so TCP RPS is equivalent to CPS for
 this run. UDP used reused worker sockets by default, so it is reported as
 request throughput rather than CPS. Timeout counts dropped as the client timeout
-grew. The 2026-09-15 `consistent_hash` rerun reached 0 TCP and UDP failures at
-`concurrency=64` with 5s timeout; its active gateway reported no target misses,
-return misses, or checksum errors.
+grew. The final 2026-09-15 `consistent_hash` rerun reached 0 TCP failures and
+54 UDP timeout failures at `concurrency=64` with 5s timeout. The UDP
+source-port sample mode reached 0 failures. Its active gateway reported no
+target misses, return misses, checksum errors, bucket misses, unusable buckets,
+or consistent-hash fallback.
 
 `consistent_hash` UDP distribution rerun:
 
 | UDP mode | Total | OK | Fail | RPS | Source ports | Backend distribution |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `reuse-per-worker` | 1882660 | 1882660 | 0 | 31377.7 | about 64 | `81.4% / 18.6%` |
-| `new-per-request` | 3590796 | 3590793 | 3 | 59846.6 | 55536 | `48.7% / 51.3%` |
+| `reuse-per-worker` | 1857572 | 1857518 | 54 | 30959.5 | 64 | `82.8% / 17.2%` |
+| `new-per-request` | 3837088 | 3837088 | 0 | 63951.5 | 55536 | `51.0% / 49.0%` |
 
 ## Repository layout
 

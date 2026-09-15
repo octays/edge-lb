@@ -1,14 +1,14 @@
 # edge-lb 高并发回归测试报告
 
 测试日期：2026-09-11  
-增补日期：2026-09-15（`consistent_hash` 回归）
+增补日期：2026-09-15（`consistent_hash` 回归与 flow persistence 部署后复测）
 测试目标：验证 VIP `192.168.0.6:8080` 在高并发 TCP/UDP 访问下的转发稳定性、后端分布、健康检查与 eBPF 目标表状态。
 
 ## 结论
 
 本报告按 listener 调度算法拆成两类：`hash` 为 2026-09-11 的历史高并发基线，`consistent_hash` 为 2026-09-15 的最新回归数据。
 
-`consistent_hash` 最新回归使用 `edge-lb 0.1.8`、`concurrency=64`、`timeout=5000ms`。TCP `511446/511446` 成功，成功 CPS `8524.1`；默认 UDP socket 复用模式下 `1882660/1882660` 成功，请求吞吐 `31377.7 req/s`。UDP 多源端口样本模式下去重源端口数 `55536`，`3590793/3590796` 成功，请求吞吐 `59846.6 req/s`，后端分布约 `48.7% / 51.3%`。active gateway `192.168.0.16` 在本轮前后 `target_miss_total`、`return_miss_total` 和 `checksum_error_total` 均保持 `0`。
+`consistent_hash` 最新回归使用最终部署后的 `edge-lb 0.1.8`、`concurrency=64`、`timeout=5000ms`。TCP `536058/536058` 成功，成功 CPS `8934.3`；默认 UDP socket 复用模式下 `1857518/1857572` 成功，请求吞吐 `30959.5 req/s`，出现 `54` 次 timeout。UDP 多源端口样本模式下去重源端口数 `55536`，`3837088/3837088` 成功，请求吞吐 `63951.5 req/s`，后端分布约 `51.0% / 49.0%`。active gateway `192.168.0.16` 在本轮后 `target_miss_total`、`return_miss_total`、`checksum_error_total`、`consistent_hash_bucket_miss_total`、`consistent_hash_bucket_unusable_total` 和 `consistent_hash_fallback_total` 均为 `0`。
 
 `hash` 历史基线在 `concurrency=64` 下完成。TCP 在 3 秒和 5 秒超时阈值下均达到 `100.00%` 成功率；UDP 在高压下仍有少量超时，超时阈值从 3 秒放宽到 5 秒后 timeout 从 `232` 次下降到 `164` 次，成功率保持 `99.99%`。压测结束后，两台 gateway 的 target group 均保持 `ok`，`NATIVE_TARGETS` 均为 `8` 个元素，两台 backend 服务均正常监听 TCP/UDP `8080`。
 
@@ -190,12 +190,12 @@ UDP 使用 `udp_socket_mode=reuse-per-worker` 时没有连接建立过程，不�
 
 | 场景 | TCP 尝试 CPS | TCP 成功 CPS | TCP 失败 CPS | UDP 请求吞吐 | UDP 成功率 | source_ports |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `concurrency=64`, `timeout=5000ms`, `reuse-per-worker` | 8524.1 | 8524.1 | 0.0 | 31377.7 req/s | 100.00% | 约 64 |
-| `concurrency=64`, `timeout=5000ms`, `udp-new-socket-per-request` | - | - | - | 59846.6 req/s | 100.00% | 55536 |
+| `concurrency=64`, `timeout=5000ms`, `reuse-per-worker` | 8934.3 | 8934.3 | 0.0 | 30959.5 req/s | 100.00% | 64 |
+| `concurrency=64`, `timeout=5000ms`, `udp-new-socket-per-request` | - | - | - | 63951.5 req/s | 100.00% | 55536 |
 
 `consistent_hash` 默认 UDP socket 复用模式用于吞吐基线；`udp-new-socket-per-request` 用于增加源端口样本，验证调度分布，不与默认 UDP socket 复用模式直接比较吞吐。
 
-#### 高并发，concurrency=64，timeout=5000ms，2026-09-15
+#### 高并发，concurrency=64，timeout=5000ms，2026-09-15 首轮
 
 测试前后两台 gateway API 均确认 listener 为 `select=consistent_hash`；active gateway 为 `192.168.0.16`。本轮使用 `edge-lb 0.1.8`，`ha-bench` 从 `192.168.0.10` 向 VIP `192.168.0.6:8080` 发起。
 
@@ -225,7 +225,46 @@ active gateway 指标增量：
 
 `consistent_hash` 下默认 UDP 后端分布不均匀。该现象来自当前 `ha-bench` UDP 默认 `reuse-per-worker`，源端口数量约等于 worker 数；一致性桶按有限源端口集合映射，不能用这组样本判断真实多客户端、多源端口场景的均匀性。TCP 默认每请求新连接，源端口样本更丰富，分布接近均衡。
 
-#### UDP 多源端口样本，concurrency=64，timeout=5000ms，2026-09-15
+#### 最终部署后复测，concurrency=64，timeout=5000ms，2026-09-15
+
+本轮在 flow persistence / HA restore 修正完成并滚动部署到两台 gateway 后执行。压测目标仍为 VIP `192.168.0.6:8080`，active gateway 为 `192.168.0.16`。
+
+```bash
+ssh <client-host> \
+  'sudo bash -lc '"'"'ulimit -n 524288; /usr/local/bin/ha-bench \
+  --target 192.168.0.6 --port 8080 --protocol both \
+  --duration 60 --concurrency 64 --payload discover --timeout-ms 5000'"'"''
+```
+
+| 协议 | total | ok | fail | 成功率 | RPS | source_ports | p50 | p95 | p99 | max | 错误 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| TCP | 536058 | 536058 | 0 | 100.00% | 8934.3 | 27768 | 5.422ms | 14.834ms | 19.325ms | 1049.146ms | 无 |
+| UDP | 1857572 | 1857518 | 54 | 100.00% | 30959.5 | 64 | 0.857ms | 8.027ms | 11.864ms | 5484.570ms | timed out x54 |
+
+后端分布：
+
+| 协议 | `192.168.0.13` | `192.168.0.14` |
+| --- | ---: | ---: |
+| TCP | 272561 | 263497 |
+| UDP | 1537099 | 320419 |
+
+active gateway 压测后指标：
+
+| 指标 | 值 |
+| --- | ---: |
+| `edge_lb_process_cpu_seconds_total` | 193.83 |
+| `edge_lb_gateway_dscp_packets_matched_total` | 8911157 |
+| `edge_lb_gateway_native_listener_hit_total` | 8911157 |
+| `edge_lb_gateway_native_rewritten_total` | 16754297 |
+| `edge_lb_gateway_native_target_miss_total` | 0 |
+| `edge_lb_gateway_native_return_miss_total` | 0 |
+| `edge_lb_gateway_native_checksum_error_total` | 0 |
+| `edge_lb_gateway_native_consistent_hash_bucket_hit_total` | 83390 |
+| `edge_lb_gateway_native_consistent_hash_bucket_miss_total` | 0 |
+| `edge_lb_gateway_native_consistent_hash_bucket_unusable_total` | 0 |
+| `edge_lb_gateway_native_consistent_hash_fallback_total` | 0 |
+
+#### UDP 多源端口样本，concurrency=64，timeout=5000ms，2026-09-15 首轮
 
 本轮只测试 UDP，使用 `udp_socket_mode=new-per-request` 增加源端口样本。新版 `ha-bench` 在 summary 中统计去重源端口数量，本轮 `source_ports=55536`。
 
@@ -240,6 +279,28 @@ active gateway 指标增量：
 | UDP | 1747850 | 1842943 |
 
 在源端口样本从约 `64` 个提升到 `55536` 个后，UDP 后端分布约为 `48.7% / 51.3%`，符合 `consistent_hash` 在两台健康后端上的预期均衡性。该模式同时增加本机 socket 创建/销毁压力，因此结论用于验证调度分布，不替代默认 UDP socket 复用模式的吞吐基线。
+
+#### UDP 多源端口样本，最终部署后复测，2026-09-15
+
+```bash
+ssh <client-host> \
+  'sudo bash -lc '"'"'ulimit -n 524288; /usr/local/bin/ha-bench \
+  --target 192.168.0.6 --port 8080 --protocol udp \
+  --duration 60 --concurrency 64 --payload discover --timeout-ms 5000 \
+  --udp-new-socket-per-request'"'"''
+```
+
+| 协议 | total | ok | fail | 成功率 | RPS | source_ports | p50 | p95 | p99 | max | 错误 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| UDP | 3837088 | 3837088 | 0 | 100.00% | 63951.5 | 55536 | 0.923ms | 1.819ms | 2.813ms | 27.880ms | 无 |
+
+后端分布：
+
+| 协议 | `192.168.0.13` | `192.168.0.14` |
+| --- | ---: | ---: |
+| UDP | 1955883 | 1881205 |
+
+本轮多源端口 UDP 分布约为 `51.0% / 49.0%`，`consistent_hash` bucket miss、unusable 和 fallback 计数均为 `0`。
 
 ### 公网 UDP 探测结果
 
@@ -296,9 +357,9 @@ udp UNCONN 0.0.0.0:8080
 ## 观察与判断
 
 1. TCP 高并发路径稳定。`concurrency=64` 下放宽到 3 秒和 5 秒超时后均为 0 失败，p99 约 `18.8ms` 到 `19.6ms`，说明正常延迟主体稳定，1 秒超时失败来自极少量尾延迟。
-2. UDP 高并发路径可用但存在少量超时。`concurrency=64` 下 3 秒超时有 `232` 次 timeout，5 秒超时下降到 `164` 次 timeout，成功率均为 `99.99%`。拉长超时可以降低 timeout，但不能完全归零，更倾向于 backend 服务处理能力、UDP socket buffer、softirq backlog 或主机协议栈队列压力，而不是固定转发路径不通。
+2. UDP 高并发路径可用但在默认 socket 复用模式下仍可能有少量超时。历史 `hash` 基线中 `concurrency=64` 下 3 秒超时有 `232` 次 timeout，5 秒超时下降到 `164` 次 timeout；最终部署后的 `consistent_hash` 复测在 5 秒超时下有 `54` 次 timeout。多源端口 UDP 模式则 `3837088/3837088` 全成功。当前判断仍更倾向于 backend 服务处理能力、UDP socket buffer、softirq backlog 或主机协议栈队列压力，而不是固定转发路径不通。
 3. 控制面和健康面未出现异常。压测后 target group、target health、backend 容器、监听状态和 eBPF map 都保持正常。
-4. 默认 UDP socket 复用模式下后端分布不如 TCP 均匀，原因是源端口数量受 worker 数影响。`--udp-new-socket-per-request` 复测将去重源端口样本提升到 `55536` 后，`consistent_hash` UDP 分布约 `48.7% / 51.3%`，更接近真实多客户端、多源端口场景。
+4. 默认 UDP socket 复用模式下后端分布不如 TCP 均匀，原因是源端口数量受 worker 数影响。`--udp-new-socket-per-request` 复测将去重源端口样本提升到 `55536` 后，`consistent_hash` UDP 分布从首轮约 `48.7% / 51.3%` 到最终部署后约 `51.0% / 49.0%`，更接近真实多客户端、多源端口场景。
 
 ## 后续建议
 
