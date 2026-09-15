@@ -30,6 +30,9 @@ sudo systemctl status edge-lb@backend
 
 Edit `/etc/edge-lb/config.toml` before exposing the API outside localhost.
 When `gateway.api.listen` is not loopback, set `gateway.api.auth_token`.
+Gateway Prometheus metrics are disabled by default; enable `[gateway.metrics]`
+only on gateway nodes and restrict `trusted_source_cidrs` to the monitoring
+network.
 
 The DSCP and native DNAT eBPF object is embedded into `edge-lb` during package
 builds. Packages do not install or require a separate eBPF object file. Runtime

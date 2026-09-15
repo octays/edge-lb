@@ -39,5 +39,10 @@ listen = "0.0.0.0:18080"
 auth_token = "change-me-token-123456"
 trusted_source_cidrs = []      # 空数组表示自动信任本机 underlay_ip 所在网段
 
+[gateway.metrics]
+enabled = false
+listen = "127.0.0.1:19090"
+trusted_source_cidrs = []      # 空数组表示只允许本机 underlay_dev 所在网段；本机抓取需显式加 127.0.0.1/32
+
 # HA 配置通过 UI/API 保存到 SQLite。二层 VIP 默认绑定 lo；如 L2/云网络
 # 要求 VIP 出现在物理接口，可在 UI 高级配置中选择 underlay。

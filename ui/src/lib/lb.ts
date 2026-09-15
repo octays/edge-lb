@@ -25,6 +25,7 @@ export function probeTypeUsesPayload(value: string) {
 export const listenerSelectOptions: { value: LbSelect; descKey: I18nKey }[] = [
   { value: 'rr', descKey: 'selectRrDesc' },
   { value: 'hash', descKey: 'selectHashDesc' },
+  { value: 'consistent_hash', descKey: 'selectConsistentHashDesc' },
   { value: 'priority', descKey: 'selectPriorityDesc' },
   { value: 'persist', descKey: 'selectPersistDesc' },
   { value: 'lc', descKey: 'selectLcDesc' },

@@ -73,11 +73,32 @@ Check hash stickiness with a fixed UDP source port:
   --udp-source-port 12345
 ```
 
+Check UDP distribution with many source port samples:
+
+```bash
+/usr/local/bin/ha-bench \
+  --target 192.168.0.6 \
+  --port 8080 \
+  --protocol udp \
+  --duration 60 \
+  --concurrency 64 \
+  --payload discover \
+  --timeout-ms 5000 \
+  --udp-new-socket-per-request
+```
+
 TCP opens a new connection per request by default, sends the payload, and then
 shuts down the write half of the socket, matching `nc -N`. Use
 `--tcp-reuse-conn` when the backend protocol supports multiple request/response
 rounds on one connection. If the peer closes a reused connection, `ha-bench`
 reconnects and retries that request once. `--udp-source-port` requires
 `--concurrency 1`; one UDP source port cannot be bound by multiple workers at
-the same time. Direct backend tests are useful only for isolation. HA
+the same time.
+
+UDP reuses one socket per worker by default. That mode is useful for testing
+fixed five-tuple throughput and typical long-lived UDP clients. Use
+`--udp-new-socket-per-request` when validating load-balancing distribution for
+algorithms such as `consistent_hash`; each request binds a fresh ephemeral
+source port, so the source port sample count grows with request count instead
+of worker count. Direct backend tests are useful only for isolation. HA
 conclusions should be based on requests to the VIP.

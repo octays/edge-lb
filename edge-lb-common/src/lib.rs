@@ -16,6 +16,7 @@ pub const NATIVE_SELECT_HASH: u32 = 1;
 pub const NATIVE_SELECT_PRIORITY: u32 = 2;
 pub const NATIVE_SELECT_PERSIST: u32 = 3;
 pub const NATIVE_SELECT_LC: u32 = 4;
+pub const NATIVE_SELECT_CONSISTENT_HASH: u32 = 5;
 
 /// Name of the TC classifier program inside the eBPF object.
 pub const PROGRAM_NAME: &str = "dscp_mark";
@@ -24,6 +25,8 @@ pub const PROGRAM_NAME: &str = "dscp_mark";
 /// compile-time bound so the verifier sees bounded loops; user space clamps
 /// target map writes to the same limit.
 pub const MAX_TARGETS_PER_LISTENER: u32 = 64;
+pub const NATIVE_CONSISTENT_HASH_BUCKETS: u32 = 1024;
+pub const NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY: u32 = 262_144;
 pub const NATIVE_LISTENER_ID_CAPACITY: u32 = 4096;
 pub const NATIVE_DNAT_INGRESS_PROGRAM: &str = "native_dnat_ingress";
 pub const NATIVE_DNAT_RETURN_PROGRAM: &str = "native_dnat_return";
@@ -96,6 +99,22 @@ pub struct NativeTargetLoadKey {
     pub target_id: u32,
 }
 
+/// Precomputed consistent-hash bucket for a native listener.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NativeConsistentHashBucketKey {
+    pub listener_id: u32,
+    pub bucket: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NativeConsistentHashBucketValue {
+    pub target_id: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -150,6 +169,63 @@ impl NativeFlowKey {
     }
 }
 
+fn mix32(mut value: u32) -> u32 {
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^ (value >> 16)
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+#[inline(always)]
+fn hash_step(hash: u32, value: u32) -> u32 {
+    hash.wrapping_mul(0x0100_0193) ^ value
+}
+
+#[inline(always)]
+fn hash_step64(hash: u64, value: u64) -> u64 {
+    hash.wrapping_mul(0x0000_0100_0000_01b3) ^ value
+}
+
+/// VIP-independent stable flow hash for the `consistent_hash` selector.
+///
+/// The flow identity is client IPv4, client source port, listener port and
+/// protocol. The VIP address is intentionally excluded so the same SIP flow
+/// identity maps consistently across VIPs and HA gateways.
+#[inline(always)]
+pub fn native_consistent_flow_hash(key: &NativeFlowKey) -> u32 {
+    let mut hash = 0x811c_9dc5;
+    hash = hash_step(hash, key.src);
+    hash = hash_step(hash, u32::from(key.sport) << 16 | u32::from(key.dport));
+    hash = hash_step(hash, u32::from(key.proto));
+    mix32(hash)
+}
+
+#[inline(always)]
+pub fn native_consistent_flow_bucket(key: &NativeFlowKey) -> u32 {
+    native_consistent_flow_hash(key) & (NATIVE_CONSISTENT_HASH_BUCKETS - 1)
+}
+
+/// HRW score used by user space to precompute a listener's consistent-hash
+/// bucket table. Target identity is target IPv4 and target port; target weight
+/// is intentionally ignored.
+#[inline(always)]
+pub fn native_consistent_bucket_score(bucket: u32, target: &NativeTargetValue) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    hash = hash_step64(hash, u64::from(bucket));
+    hash = hash_step64(hash, u64::from(target.address));
+    hash = hash_step64(hash, u64::from(target.port));
+    mix64(hash)
+}
+
 #[cfg(test)]
 mod flow_key_tests {
     use super::*;
@@ -184,8 +260,10 @@ mod flow_key_tests {
 #[cfg(test)]
 mod scheduler_tests {
     use super::{
-        NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY,
-        NATIVE_SELECT_RR, NativeFlowKey,
+        NATIVE_CONSISTENT_HASH_BUCKETS, NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH,
+        NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
+        NativeFlowKey, NativeTargetValue, native_consistent_bucket_score,
+        native_consistent_flow_bucket,
     };
 
     fn key(source_port: u16) -> NativeFlowKey {
@@ -266,6 +344,36 @@ mod scheduler_tests {
         None
     }
 
+    fn consistent_pick(key: &NativeFlowKey, targets: &[NativeTargetValue]) -> Option<usize> {
+        let bucket = native_consistent_flow_bucket(key);
+        consistent_bucket_pick(bucket, targets)
+    }
+
+    fn consistent_bucket_pick(bucket: u32, targets: &[NativeTargetValue]) -> Option<usize> {
+        let mut best = None;
+        let mut best_score = 0u64;
+        for (index, target) in targets.iter().enumerate() {
+            if target.flags & 1 == 0 || target.weight == 0 {
+                continue;
+            }
+            let score = native_consistent_bucket_score(bucket, target);
+            if best.is_none() || score > best_score {
+                best = Some(index);
+                best_score = score;
+            }
+        }
+        best
+    }
+
+    fn consistent_target(index: u32) -> NativeTargetValue {
+        NativeTargetValue {
+            address: 0xc000_020a + index,
+            port: 5060,
+            weight: 1,
+            flags: 1,
+        }
+    }
+
     #[test]
     fn weighted_selection_skips_unhealthy_targets() {
         assert_eq!(weighted_pick(0, &[1, 1], &[false, true]), Some(1));
@@ -316,6 +424,311 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn consistent_hash_ignores_vip_address() {
+        let first = key(40000);
+        let second = NativeFlowKey {
+            dst: 0x0a00_0006,
+            ..first
+        };
+        let targets = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+
+        assert_eq!(
+            consistent_pick(&first, &targets),
+            consistent_pick(&second, &targets)
+        );
+    }
+
+    #[test]
+    fn consistent_hash_ignores_weight_values_except_zero_disable() {
+        let flow = key(40000);
+        let targets = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+        let weighted = [
+            NativeTargetValue {
+                weight: 100,
+                ..targets[0]
+            },
+            NativeTargetValue {
+                weight: 1,
+                ..targets[1]
+            },
+        ];
+        let disabled_first = [
+            NativeTargetValue {
+                weight: 0,
+                ..targets[0]
+            },
+            targets[1],
+        ];
+
+        assert_eq!(
+            consistent_pick(&flow, &targets),
+            consistent_pick(&flow, &weighted)
+        );
+        assert_eq!(consistent_pick(&flow, &disabled_first), Some(1));
+    }
+
+    #[test]
+    fn consistent_hash_is_repeatable_for_the_same_flow() {
+        let flow = key(41000);
+        let targets = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020f,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+
+        let expected = consistent_pick(&flow, &targets);
+        for _ in 0..128 {
+            assert_eq!(consistent_pick(&flow, &targets), expected);
+        }
+    }
+
+    #[test]
+    fn consistent_hash_is_stable_by_target_identity_not_slot_order() {
+        let flow = key(42000);
+        let first_order = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020f,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+        let second_order = [first_order[2], first_order[0], first_order[1]];
+
+        let first = consistent_pick(&flow, &first_order).map(|index| first_order[index].address);
+        let second = consistent_pick(&flow, &second_order).map(|index| second_order[index].address);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn consistent_hash_removing_target_preserves_other_flows() {
+        let targets = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020f,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+        let remaining = [targets[0], targets[2]];
+
+        for source_port in 40000..41000 {
+            let flow = key(source_port);
+            let before = consistent_pick(&flow, &targets).map(|index| targets[index].address);
+            let after = consistent_pick(&flow, &remaining).map(|index| remaining[index].address);
+            if before != Some(targets[1].address) {
+                assert_eq!(after, before);
+            }
+        }
+    }
+
+    #[test]
+    fn consistent_hash_adding_target_only_moves_flows_won_by_new_target() {
+        let targets = [
+            NativeTargetValue {
+                address: 0xc000_020d,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+            NativeTargetValue {
+                address: 0xc000_020e,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+        let expanded = [
+            targets[0],
+            targets[1],
+            NativeTargetValue {
+                address: 0xc000_020f,
+                port: 5060,
+                weight: 1,
+                flags: 1,
+            },
+        ];
+
+        for source_port in 40000..41000 {
+            let flow = key(source_port);
+            let before = consistent_pick(&flow, &targets).map(|index| targets[index].address);
+            let after = consistent_pick(&flow, &expanded).map(|index| expanded[index].address);
+            if after != Some(expanded[2].address) {
+                assert_eq!(after, before);
+            }
+        }
+    }
+
+    #[test]
+    fn consistent_hash_bucket_distribution_is_reasonably_even() {
+        let targets = [
+            consistent_target(0),
+            consistent_target(1),
+            consistent_target(2),
+            consistent_target(3),
+        ];
+        let mut counts = [0usize; 4];
+        for bucket in 0..NATIVE_CONSISTENT_HASH_BUCKETS {
+            let index = consistent_bucket_pick(bucket, &targets).expect("bucket should pick");
+            counts[index] += 1;
+        }
+
+        let expected = NATIVE_CONSISTENT_HASH_BUCKETS as f64 / counts.len() as f64;
+        for count in counts {
+            let skew = ((count as f64 - expected) / expected).abs();
+            assert!(skew < 0.15, "bucket count {count} skew {skew:.3}");
+        }
+    }
+
+    #[test]
+    fn consistent_hash_adding_target_moves_about_one_new_target_share() {
+        let before = [
+            consistent_target(0),
+            consistent_target(1),
+            consistent_target(2),
+            consistent_target(3),
+        ];
+        let after = [
+            before[0],
+            before[1],
+            before[2],
+            before[3],
+            consistent_target(4),
+        ];
+        let mut moved = 0usize;
+        for bucket in 0..NATIVE_CONSISTENT_HASH_BUCKETS {
+            let old = consistent_bucket_pick(bucket, &before).expect("old bucket should pick");
+            let new = consistent_bucket_pick(bucket, &after).expect("new bucket should pick");
+            if after[new].address != before[old].address {
+                moved += 1;
+            }
+        }
+
+        let moved_ratio = moved as f64 / NATIVE_CONSISTENT_HASH_BUCKETS as f64;
+        assert!(
+            (0.15..0.25).contains(&moved_ratio),
+            "moved ratio {moved_ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn consistent_hash_removing_target_moves_only_removed_target_share() {
+        let before = [
+            consistent_target(0),
+            consistent_target(1),
+            consistent_target(2),
+            consistent_target(3),
+            consistent_target(4),
+        ];
+        let after = [before[0], before[1], before[3], before[4]];
+        let removed = before[2];
+        let mut moved = 0usize;
+        let mut removed_winners = 0usize;
+        for bucket in 0..NATIVE_CONSISTENT_HASH_BUCKETS {
+            let old = consistent_bucket_pick(bucket, &before).expect("old bucket should pick");
+            let new = consistent_bucket_pick(bucket, &after).expect("new bucket should pick");
+            if before[old].address == removed.address {
+                removed_winners += 1;
+                moved += 1;
+            } else {
+                assert_eq!(after[new].address, before[old].address);
+            }
+        }
+
+        assert_eq!(moved, removed_winners);
+        let moved_ratio = moved as f64 / NATIVE_CONSISTENT_HASH_BUCKETS as f64;
+        assert!(
+            (0.15..0.25).contains(&moved_ratio),
+            "moved ratio {moved_ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn consistent_hash_bucket_count_is_power_of_two() {
+        assert_eq!(NATIVE_CONSISTENT_HASH_BUCKETS, 1024);
+        assert_eq!(
+            NATIVE_CONSISTENT_HASH_BUCKETS & (NATIVE_CONSISTENT_HASH_BUCKETS - 1),
+            0
+        );
+    }
+
+    #[test]
+    fn consistent_hash_bucket_score_uses_64_bits() {
+        let target = NativeTargetValue {
+            address: 0xc000_020d,
+            port: 5060,
+            weight: 1,
+            flags: 1,
+        };
+        assert!(native_consistent_bucket_score(17, &target) > u64::from(u32::MAX));
+    }
+
+    #[test]
     fn persist_default_timeout_is_three_hours() {
         assert_eq!(super::DEFAULT_PERSIST_TIMEOUT_SECS, 10_800);
     }
@@ -327,6 +740,7 @@ mod scheduler_tests {
         assert_eq!(NATIVE_SELECT_PRIORITY, 2);
         assert_eq!(NATIVE_SELECT_PERSIST, 3);
         assert_eq!(NATIVE_SELECT_LC, 4);
+        assert_eq!(NATIVE_SELECT_CONSISTENT_HASH, 5);
     }
 }
 
@@ -350,6 +764,10 @@ pub struct NativeDatapathStats {
     pub target_miss: u64,
     pub rewritten: u64,
     pub checksum_error: u64,
+    pub chash_bucket_hit: u64,
+    pub chash_bucket_miss: u64,
+    pub chash_bucket_unusable: u64,
+    pub chash_fallback: u64,
 }
 
 #[cfg(feature = "user")]
@@ -362,6 +780,10 @@ unsafe impl aya::Pod for NativeTargetKey {}
 unsafe impl aya::Pod for NativeTargetLoadKey {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for NativeTargetValue {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NativeConsistentHashBucketKey {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for NativeConsistentHashBucketValue {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for NativeFlowKey {}
 #[cfg(feature = "user")]

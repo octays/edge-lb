@@ -3,6 +3,10 @@
 The management API has one public namespace: `/api/v1`. Unversioned `/api/...`
 paths are rejected with HTTP 404 and are not alternate aliases.
 
+Prometheus metrics are not part of `/api/v1`. When `[gateway.metrics]` is
+enabled, the gateway daemon exposes `GET /metrics` on a separate port protected
+only by CIDR allowlist.
+
 ## Resources
 
 - `GET /api/v1/status`

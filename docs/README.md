@@ -13,6 +13,16 @@
 - `vxlan-dscp-verified.md`：当前线上验证方案，记录已验证节点、VXLAN/DSCP
   参数、验证命令和排障检查。
 - `ha-pressure-test-report.zh-CN.md` / `ha-pressure-test-report.md`：HA 和并发压测报告。
+- `forwarding-performance-options.md`：gateway 转发性能候选方案评估，比较当前 TC DNAT、
+  veth、TC redirect、XDP 和 AF_XDP 的收益边界与验证顺序。
+- `cloudflare-unimog-reference.md`：Cloudflare Unimog eBPF/XDP L4LB 公开实现参考，
+  记录其 XDP、GUE、forwarding table、健康状态和 TC redirector 设计，以及与 edge-lb
+  当前架构的差异。
+- `metrics-endpoint-plan.md`：gateway-only 独立 metrics 端口、CIDR 白名单和
+  Prometheus 指标范围。
+- `metrics.md`：gateway metrics 指标清单、含义、PromQL 示例和采集开销说明。
+- `flow-map-persistence-research.md`：native flow map 持久化调研，说明快照/恢复边界、
+  时间语义、target remap、性能风险和推荐落地步骤。
 
 ## 参考资料
 

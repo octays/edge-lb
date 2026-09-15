@@ -254,15 +254,18 @@ fn edit_snapshot(
         &state.target_groups,
     )
     .map_err(|error| Rejection::new(400, format!("invalid listener config: {error:#}")))?;
-    if let Some(existing) = state
-        .listeners
+    let mut listeners = state.listeners.clone();
+    if let Some(existing) = listeners
         .iter_mut()
         .find(|item| Some(item.name.as_str()) == old_name)
     {
         *existing = listener.clone();
     } else {
-        state.listeners.push(listener.clone());
+        listeners.push(listener.clone());
     }
+    validate_consistent_hash_listener_capacity(cfg, &listeners)
+        .map_err(|error| Rejection::new(400, format!("invalid listener config: {error:#}")))?;
+    state.listeners = listeners;
     Ok(())
 }
 
@@ -370,6 +373,24 @@ fn validate_listener_config(
         }
     }
     Ok(())
+}
+
+fn validate_consistent_hash_listener_capacity(
+    cfg: &Config,
+    listeners: &[Listener],
+) -> anyhow::Result<()> {
+    let mut file = cfg.file.clone();
+    file.listeners = listeners.to_vec();
+    file.validate_consistent_hash_listener_capacity(|_, listener| {
+        let vip_count = crate::provider::native::effective_vip_ips(cfg, &listener.vip_ips)?.len();
+        let protocol_count = listener
+            .protocols
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(vip_count * protocol_count)
+    })
 }
 
 fn native_generated_listener_name(protocol: &str, port: u16) -> String {
@@ -547,6 +568,36 @@ mod tests {
 
         assert_eq!(state.listeners.len(), 1);
         assert_eq!(state.listeners[0].target_port, 18081);
+    }
+
+    #[test]
+    fn consistent_hash_listener_create_rejects_bucket_capacity_overflow() {
+        let mut cfg = test_cfg();
+        cfg.file.network.gateway_ip = "192.0.2.1".parse().unwrap();
+        let mut state = snapshot();
+        let max = (edge_lb_common::NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY
+            / edge_lb_common::NATIVE_CONSISTENT_HASH_BUCKETS) as usize;
+
+        for offset in 0..max {
+            let mut listener = test_listener(10_000 + offset as u16);
+            listener.vip_ips.clear();
+            listener.select = LbSelect::ConsistentHash;
+            edit_snapshot(&cfg, &mut state, &listener, &ListenerMutation::Create).unwrap();
+        }
+
+        let mut overflow = test_listener(10_000 + max as u16);
+        overflow.vip_ips.clear();
+        overflow.select = LbSelect::ConsistentHash;
+        let error =
+            edit_snapshot(&cfg, &mut state, &overflow, &ListenerMutation::Create).unwrap_err();
+
+        assert_eq!(error.status, 400);
+        assert!(
+            error
+                .message
+                .contains("consistent_hash listener expansion uses")
+        );
+        assert_eq!(state.listeners.len(), max);
     }
 
     #[test]

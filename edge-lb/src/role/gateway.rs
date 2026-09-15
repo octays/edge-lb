@@ -236,6 +236,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     // window as node changes, not before the xDS server has started.
     let mut cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
     spawn_ui(&cfg);
+    crate::metrics::spawn_gateway(&cfg)?;
     crate::runtime::proxy_replication::spawn(&cfg)?;
     spawn_probe_worker(&cfg);
     spawn_flow_sync_worker(&cfg);

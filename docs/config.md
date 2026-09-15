@@ -20,6 +20,7 @@ sudo systemctl restart edge-lb
 | `[gateway.xds]` | yes | no | gateway 监听 xDS-like 控制面；trusted_source_cidrs 为空时自动取 underlay 网段 |
 | `[gateway.network]` | yes | no | overlay/VXLAN/DSCP 全局参数源 |
 | `[gateway.api]` | yes | no | 管理 API/UI，gateway 必须启用 |
+| `[gateway.metrics]` | yes | no | gateway-only Prometheus metrics 独立端口，默认关闭 |
 | `[gateway.network]` | yes | no | native VXLAN、overlay 和 DSCP 参数 |
 | `[backend.xds]` | no | yes | backend 连接 gateway 控制面 |
 | `[backend.return_path]` | no | yes | backend 本机 nft、策略路由、MSS 参数 |
@@ -44,6 +45,20 @@ backend 保留当前内核 VXLAN/nft/route 状态并重连；重启后需要重�
 必须配置 `auth_token`，并使用 Bearer token 访问。`[gateway.api].trusted_source_cidrs`
 为空数组时自动信任本机 `underlay_ip` 所在网段；显式配置时只允许这些 CIDR 调用
 `/api/*`。
+
+gateway 可通过 `[gateway.metrics]` 启用独立 Prometheus metrics 端口：
+
+```toml
+[gateway.metrics]
+enabled = true
+listen = "0.0.0.0:19090"
+trusted_source_cidrs = ["192.168.0.0/24"]
+```
+
+metrics 只在 gateway daemon 中启动，backend 不提供 metrics HTTP 端口。metrics 只接受
+`GET /metrics`，不属于 `/api/v1`，也不使用 Bearer token。`trusted_source_cidrs`
+为空数组时只允许本机 `underlay_dev` 所在接口网段；如果需要本机 Prometheus 通过
+`127.0.0.1` 抓取，需要显式加入 `127.0.0.1/32`。
 
 ## Gateway HA 与 VIP
 
@@ -210,6 +225,7 @@ edge-lb DSCP filter 执行。可以共存，但白名单必须让 edge-lb 相关
 - gateway 间 HA/BFD 或控制面使用的端口。
 - backend 到 gateway 的 xDS TCP `22222`。
 - 管理 API TCP `18080`，仅限可信来源。
+- metrics TCP `19090`，仅在 `[gateway.metrics].enabled = true` 时放行可信来源。
 
 gateway 启动和巡检会检测 `underlay_dev` 上的 XDP attachment。如果发现外部 XDP，
 日志会提示需要配置的 PASS 端口，`/api/v1/status` 也会返回

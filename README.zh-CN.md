@@ -100,6 +100,7 @@ node_role = "gateway"        # gateway | backend
 [gateway.xds]                # xDS-like 控制面监听
 [gateway.network]            # overlay/VXLAN/DSCP 参数源
 [gateway.api]                # 管理 UI/API
+[gateway.metrics]            # gateway-only Prometheus metrics
 [backend.xds]                # backend 订阅 gateway xDS
 [backend.return_path]        # backend nft/route 回程配置
 ```
@@ -137,6 +138,18 @@ POST    /api/v1/operations/{apply|cleanup}
 （Bearer），否则拒绝启动。API 来源还要匹配 `gateway.api.trusted_source_cidrs`；
 空数组表示自动信任本机 underlay IP 所在网段。
 
+gateway 可选开启独立 metrics 端口：
+
+```toml
+[gateway.metrics]
+enabled = true
+listen = "0.0.0.0:19090"
+trusted_source_cidrs = ["192.168.0.0/24"]
+```
+
+metrics 只提供 `GET /metrics`，不属于 `/api/v1`，只使用 CIDR 白名单。
+完整指标清单见 **[docs/metrics.md](docs/metrics.md)**。
+
 ## 性能测试摘要
 
 2026-09-11 高并发实验使用 VIP `192.168.0.6:8080`，文档中已省略公网地址。
@@ -145,10 +158,10 @@ POST    /api/v1/operations/{apply|cleanup}
 
 | 角色 | 主机 | 实验地址 | 运行状态 | CPU / 内存 | CPU 频率采样 |
 | --- | --- | --- | --- | --- | --- |
-| gateway-a | VM-0-12-ubuntu | `192.168.0.12` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
-| gateway-b | VM-0-16-ubuntu | `192.168.0.16` | `edge-lb 0.1.7`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
-| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.7`, active | 1 vCPU AMD EPYC 7K62, 0.9 GiB | 2595.1 MHz |
-| backend-b | VM-0-13-ubuntu | `192.168.0.13` | `edge-lb 0.1.7`, active | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
+| gateway-a | VM-0-12-ubuntu | `192.168.0.12` | `edge-lb 0.1.8`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| gateway-b | VM-0-16-ubuntu | `192.168.0.16` | `edge-lb 0.1.8`, active | 2 vCPU AMD EPYC 7K62, 3.6 GiB | 2595.1 MHz |
+| backend-a | VM-0-14-ubuntu | `192.168.0.14` | `edge-lb 0.1.8`, active | 1 vCPU AMD EPYC 7K62, 0.9 GiB | 2595.1 MHz |
+| backend-b | VM-0-13-ubuntu | `192.168.0.13` | `edge-lb 0.1.8`, active | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
 | client | VM-0-10-ubuntu | `192.168.0.10` | `ha-bench` | 2 vCPU General Processors, 1.9 GiB | 2595.1 MHz |
 
 | 场景 | TCP 成功 CPS | TCP 成功率 | UDP 请求吞吐 | UDP 成功率 |
@@ -157,11 +170,21 @@ POST    /api/v1/operations/{apply|cleanup}
 | `concurrency=64`, `timeout=1000ms` | 8906.9 | 99.98% | 31204.1 req/s | 99.97% |
 | `concurrency=64`, `timeout=3000ms` | 8928.1 | 100.00% | 30856.4 req/s | 99.99% |
 | `concurrency=64`, `timeout=5000ms` | 8839.3 | 100.00% | 31658.8 req/s | 99.99% |
+| `consistent_hash`, `concurrency=64`, `timeout=5000ms` | 8524.1 | 100.00% | 31377.7 req/s | 100.00% |
+| `consistent_hash` UDP 源端口样本，`concurrency=64`, `timeout=5000ms` | - | - | 59846.6 req/s | 100.00% |
 
 TCP 测试模式为 `new-per-request`，因此本轮 TCP RPS 可视为 CPS。UDP 使用 worker
 socket 复用，没有连接建立过程，所以按请求吞吐统计。随着客户端 timeout 拉长，
-timeout 数明显下降；剩余 UDP 尾部 timeout 更倾向于 backend 服务处理能力或主机
-协议栈队列压力，而不是 edge-lb 固定转发路径异常。
+timeout 数明显下降。2026-09-15 的 `consistent_hash` 回归在 `concurrency=64`、
+5 秒 timeout 下 TCP/UDP 均为 0 失败；active gateway 未记录 target miss、
+return miss 或 checksum error。
+
+`consistent_hash` UDP 分布复测：
+
+| UDP 模式 | total | ok | fail | RPS | 去重源端口 | 后端分布 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `reuse-per-worker` | 1882660 | 1882660 | 0 | 31377.7 | 约 64 | `81.4% / 18.6%` |
+| `new-per-request` | 3590796 | 3590793 | 3 | 59846.6 | 55536 | `48.7% / 51.3%` |
 
 ## 仓库结构
 

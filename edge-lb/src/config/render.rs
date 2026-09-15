@@ -80,6 +80,16 @@ fn render_gateway_sections(file: &FileConfig, out: &mut String) {
         file.api.trusted_source_cidrs
     ));
     out.push('\n');
+
+    let metrics = file.gateway.metrics.clone().unwrap_or_default();
+    out.push_str("[gateway.metrics]\n");
+    out.push_str(&format!("enabled = {}\n", metrics.enabled));
+    out.push_str(&format!("listen = {:?}\n", metrics.listen));
+    out.push_str(&format!(
+        "trusted_source_cidrs = {:?}\n",
+        metrics.trusted_source_cidrs
+    ));
+    out.push('\n');
 }
 
 fn render_backend_sections(file: &FileConfig, out: &mut String) {

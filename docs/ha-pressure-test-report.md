@@ -57,8 +57,8 @@ Tools added:
   writes raw TSV plus summary data.
 - `scripts/edge-lb-ha-failover-pressure.sh`: triggers HA failover during a
   pressure run and summarizes before, during, and after phases.
-- `ha-bench`: Rust pressure client that records true socket RTT and backend
-  distribution.
+- `ha-bench`: Rust pressure client that records true socket RTT, source port
+  samples, and backend distribution.
 
 Build the Rust client:
 
@@ -111,8 +111,10 @@ Check hash stickiness with a fixed UDP source port:
 `--udp-source-port` requires `--concurrency 1`, because the same local UDP port
 cannot be bound by multiple workers. Without `--udp-source-port`, each UDP
 worker reuses one ephemeral UDP socket by default. Use
-`--udp-new-socket-per-request` only when explicitly testing flow creation and
-cleanup pressure.
+`--udp-new-socket-per-request` when explicitly testing flow creation, cleanup
+pressure, or hash distribution across many UDP source ports. The summary prints
+the number of unique source ports as `source_ports`, and raw TSV output includes
+a `source_port` column.
 
 ## Results
 

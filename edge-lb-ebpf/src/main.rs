@@ -18,10 +18,13 @@ use aya_ebpf::{
 };
 use aya_ebpf_cty::c_long;
 use edge_lb_common::{
-    DEFAULT_DSCP, DSCP_PORT_MAP_CAPACITY, MAX_TARGETS_PER_LISTENER, NATIVE_LISTENER_ID_CAPACITY,
-    NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY,
-    NATIVE_SELECT_RR, NativeFlowEvent, NativeFlowKey, NativeFlowValue, NativeListenerLookupKey,
-    NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue, Stats,
+    DEFAULT_DSCP, DSCP_PORT_MAP_CAPACITY, MAX_TARGETS_PER_LISTENER,
+    NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_LISTENER_ID_CAPACITY,
+    NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST,
+    NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR, NativeConsistentHashBucketKey,
+    NativeConsistentHashBucketValue, NativeFlowEvent, NativeFlowKey, NativeFlowValue,
+    NativeListenerLookupKey, NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey,
+    NativeTargetValue, Stats, native_consistent_flow_bucket,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -48,6 +51,12 @@ static NATIVE_TARGETS: HashMap<NativeTargetKey, NativeTargetValue> =
     HashMap::with_max_entries(16384, 0);
 
 #[map]
+static NATIVE_CHASH_BUCKETS: HashMap<
+    NativeConsistentHashBucketKey,
+    NativeConsistentHashBucketValue,
+> = HashMap::with_max_entries(NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, 1);
+
+#[map]
 static NATIVE_RR_COUNTERS: Array<u32> = Array::with_max_entries(NATIVE_LISTENER_ID_CAPACITY, 0);
 
 #[map]
@@ -55,7 +64,7 @@ static NATIVE_ACTIVE_FLOWS: HashMap<NativeTargetLoadKey, u32> = HashMap::with_ma
 
 #[map]
 static NATIVE_FLOWS: LruHashMap<NativeFlowKey, NativeFlowValue> =
-    LruHashMap::with_max_entries(262144, 0);
+    LruHashMap::with_max_entries(1048576, 0);
 
 #[map]
 static NATIVE_FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
@@ -398,6 +407,9 @@ fn select_target(
         // persist is stable per client address, unlike hash which includes
         // transport ports and therefore distributes new client connections.
         NATIVE_SELECT_PERSIST => select_persist_slot(key.src, listener, count),
+        // consistent_hash is VIP-independent and uses a precomputed bucket
+        // table so the TC path stays constant-time.
+        NATIVE_SELECT_CONSISTENT_HASH => select_consistent_hash(key, listener, count),
         // lc chooses the healthy target with the fewest active flows. Ties
         // rotate through the per-listener cursor so an empty listener does not
         // send every first flow to target zero.
@@ -525,6 +537,29 @@ fn target_slot_is_usable(listener_id: u32, target_id: u32) -> bool {
     } else {
         false
     }
+}
+
+fn select_consistent_hash(
+    key: &NativeFlowKey,
+    listener: &NativeListenerLookupValue,
+    count: u32,
+) -> u32 {
+    let bucket_key = NativeConsistentHashBucketKey {
+        listener_id: listener.listener_id,
+        bucket: native_consistent_flow_bucket(key),
+    };
+    if let Some(value) = unsafe { NATIVE_CHASH_BUCKETS.get(&bucket_key) } {
+        native_bump(|stats| stats.chash_bucket_hit += 1);
+        let target_id = value.target_id;
+        if target_id < count && target_slot_is_usable(listener.listener_id, target_id) {
+            return target_id;
+        }
+        native_bump(|stats| stats.chash_bucket_unusable += 1);
+    } else {
+        native_bump(|stats| stats.chash_bucket_miss += 1);
+    }
+    native_bump(|stats| stats.chash_fallback += 1);
+    first_usable_target(listener.listener_id, count)
 }
 
 fn select_least_connections(listener: &NativeListenerLookupValue, count: u32) -> u32 {

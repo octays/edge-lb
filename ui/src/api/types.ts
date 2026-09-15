@@ -3,7 +3,7 @@
 
 export type NodeRole = 'backend' | 'gateway'
 export type Protocol = 'tcp' | 'udp'
-export type LbSelect = 'rr' | 'hash' | 'priority' | 'persist' | 'lc'
+export type LbSelect = 'rr' | 'hash' | 'consistent_hash' | 'priority' | 'persist' | 'lc'
 
 export interface PageQuery {
   page?: number

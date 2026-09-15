@@ -5,7 +5,7 @@
 //! packets arriving from the backend overlay.
 
 use std::{
-    collections::{HashMap as StdHashMap, HashSet},
+    collections::{BTreeMap, HashMap as StdHashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -19,10 +19,13 @@ use aya::{
     },
 };
 use edge_lb_common::{
-    DEFAULT_PERSIST_TIMEOUT_SECS, MAX_TARGETS_PER_LISTENER, NATIVE_DNAT_INGRESS_PROGRAM,
-    NATIVE_DNAT_RETURN_PROGRAM, NATIVE_LISTENER_ID_CAPACITY, NativeListenerLookupKey,
+    DEFAULT_PERSIST_TIMEOUT_SECS, MAX_TARGETS_PER_LISTENER, NATIVE_CONSISTENT_HASH_BUCKETS,
+    NATIVE_DNAT_INGRESS_PROGRAM, NATIVE_DNAT_RETURN_PROGRAM, NATIVE_LISTENER_ID_CAPACITY,
+    NativeConsistentHashBucketKey, NativeConsistentHashBucketValue, NativeListenerLookupKey,
     NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
+    native_consistent_bucket_score,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::Config,
@@ -33,14 +36,16 @@ use crate::{
 
 const LISTENERS: &str = "NATIVE_LISTENERS";
 const TARGETS: &str = "NATIVE_TARGETS";
+const CHASH_BUCKETS: &str = "NATIVE_CHASH_BUCKETS";
 const FLOWS: &str = "NATIVE_FLOWS";
 const STATS: &str = "NATIVE_STATS";
 const FLOW_EVENTS: &str = "NATIVE_FLOW_EVENTS";
 const RR_COUNTERS: &str = "NATIVE_RR_COUNTERS";
 const ACTIVE_FLOWS: &str = "NATIVE_ACTIVE_FLOWS";
-const MAPS: [&str; 7] = [
+const MAPS: [&str; 8] = [
     LISTENERS,
     TARGETS,
+    CHASH_BUCKETS,
     FLOWS,
     RR_COUNTERS,
     ACTIVE_FLOWS,
@@ -66,6 +71,17 @@ pub struct NativeDnatAttachment {
 /// object's map fds and detaches its filters.
 static CURRENT: std::sync::Mutex<Option<NativeDnatAttachment>> = std::sync::Mutex::new(None);
 static CURRENT_SIGNATURE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsistentHashBucketDigest {
+    pub listener_id: u32,
+    pub listener_name: String,
+    pub vip: String,
+    pub port: u16,
+    pub protocol: &'static str,
+    pub bucket_count: u32,
+    pub digest: String,
+}
 
 impl Drop for NativeDnatAttachment {
     fn drop(&mut self) {
@@ -186,16 +202,7 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                     .ok_or_else(|| anyhow!("{TARGETS} map missing"))?,
             )?;
         for (listener_id, listener) in &listener_ids {
-            if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
-                // The eBPF selector scans a compile-time bound; extra
-                // targets would be silently unreachable.
-                anyhow::bail!(
-                    "listener {} has {} targets; max {}",
-                    listener.key.vip_port,
-                    listener.targets.len(),
-                    MAX_TARGETS_PER_LISTENER
-                );
-            }
+            validate_listener_target_count(listener)?;
             for (target_id, target) in listener.targets.iter().enumerate() {
                 if !native_target_is_active(observed_targets.as_ref(), listener, target) {
                     continue;
@@ -214,6 +221,21 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
                     0,
                 )?;
             }
+        }
+    }
+    {
+        let mut buckets: HashMap<
+            &mut MapData,
+            NativeConsistentHashBucketKey,
+            NativeConsistentHashBucketValue,
+        > = HashMap::try_from(
+            bpf.map_mut(CHASH_BUCKETS)
+                .ok_or_else(|| anyhow!("{CHASH_BUCKETS} map missing"))?,
+        )?;
+        for (key, value) in
+            desired_consistent_hash_buckets(&listener_ids, observed_targets.as_ref())?
+        {
+            buckets.insert(key, value, 0)?;
         }
     }
     for name in MAPS {
@@ -298,6 +320,20 @@ fn native_target_is_active(
         )
 }
 
+fn validate_listener_target_count(
+    listener: &crate::provider::native::NativeListener,
+) -> Result<()> {
+    if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
+        bail!(
+            "listener {} has {} targets; max {}",
+            listener.key.vip_port,
+            listener.targets.len(),
+            MAX_TARGETS_PER_LISTENER
+        );
+    }
+    Ok(())
+}
+
 fn attach_program(bpf: &mut Ebpf, name: &str, dev: &str, priority: u16) -> Result<()> {
     let program: &mut SchedClassifier = bpf
         .program_mut(name)
@@ -364,6 +400,7 @@ fn sync_pinned_datapath(
     let listener_ids = stable_listener_assignments(listeners)?;
     sync_listener_map(cfg, &listener_ids)?;
     sync_target_map(cfg, &listener_ids)?;
+    sync_consistent_hash_bucket_map(cfg, &listener_ids)?;
     Ok(())
 }
 
@@ -439,14 +476,7 @@ fn sync_target_map(
     let observed_targets = target_health_native(cfg).ok();
     let mut desired = HashSet::new();
     for (listener_id, listener) in listener_ids {
-        if listener.targets.len() > MAX_TARGETS_PER_LISTENER as usize {
-            bail!(
-                "listener {} has {} targets; max {}",
-                listener.key.vip_port,
-                listener.targets.len(),
-                MAX_TARGETS_PER_LISTENER
-            );
-        }
+        validate_listener_target_count(listener)?;
         for (target_id, target) in listener.targets.iter().enumerate() {
             if !native_target_is_active(observed_targets.as_ref(), listener, target) {
                 continue;
@@ -479,6 +509,150 @@ fn sync_target_map(
         }
     }
     Ok(())
+}
+
+fn sync_consistent_hash_bucket_map(
+    cfg: &Config,
+    listener_ids: &[(u32, &crate::provider::native::NativeListener)],
+) -> Result<()> {
+    let map_data = MapData::from_pin(pin_path(cfg, CHASH_BUCKETS))
+        .with_context(|| format!("opening {CHASH_BUCKETS}"))?;
+    let map = Map::from_map_data(map_data)
+        .with_context(|| format!("{CHASH_BUCKETS} is not a hash map"))?;
+    let mut buckets: HashMap<
+        MapData,
+        NativeConsistentHashBucketKey,
+        NativeConsistentHashBucketValue,
+    > = HashMap::try_from(map)
+        .with_context(|| format!("{CHASH_BUCKETS} key/value layout mismatch"))?;
+    let observed_targets = target_health_native(cfg).ok();
+    let desired = desired_consistent_hash_buckets(listener_ids, observed_targets.as_ref())?;
+    for (key, value) in &desired {
+        buckets.insert(*key, *value, 0)?;
+    }
+    let existing = buckets
+        .iter()
+        .map(|entry| entry.map(|(key, _)| key))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("iterating {CHASH_BUCKETS}"))?;
+    for key in existing {
+        if !desired.contains_key(&key) {
+            let _ = buckets.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+fn desired_consistent_hash_buckets(
+    listener_ids: &[(u32, &crate::provider::native::NativeListener)],
+    observed_targets: Option<&TargetHealthList>,
+) -> Result<StdHashMap<NativeConsistentHashBucketKey, NativeConsistentHashBucketValue>> {
+    let mut desired = StdHashMap::new();
+    for (listener_id, listener) in listener_ids {
+        validate_listener_target_count(listener)?;
+        if listener.select != crate::config::LbSelect::ConsistentHash.code() {
+            continue;
+        }
+        let mut targets = Vec::new();
+        for (target_id, target) in listener.targets.iter().enumerate() {
+            if !native_target_is_active(observed_targets, listener, target) || target.weight == 0 {
+                continue;
+            }
+            targets.push((
+                target_id as u32,
+                NativeTargetValue {
+                    address: u32::from_be_bytes(target.address.octets()),
+                    port: target.port,
+                    weight: target.weight.min(u16::MAX as u32) as u16,
+                    flags: 1,
+                },
+            ));
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        for bucket in 0..NATIVE_CONSISTENT_HASH_BUCKETS {
+            if let Some(target_id) = choose_consistent_hash_bucket_target(bucket, &targets) {
+                desired.insert(
+                    NativeConsistentHashBucketKey {
+                        listener_id: *listener_id,
+                        bucket,
+                    },
+                    NativeConsistentHashBucketValue { target_id },
+                );
+            }
+        }
+    }
+    Ok(desired)
+}
+
+fn choose_consistent_hash_bucket_target(
+    bucket: u32,
+    targets: &[(u32, NativeTargetValue)],
+) -> Option<u32> {
+    let mut selected = None;
+    let mut best_score = 0u64;
+    for (target_id, target) in targets {
+        let score = native_consistent_bucket_score(bucket, target);
+        if selected.is_none() || score > best_score {
+            selected = Some(*target_id);
+            best_score = score;
+        }
+    }
+    selected
+}
+
+pub fn consistent_hash_bucket_digests(cfg: &Config) -> Result<Vec<ConsistentHashBucketDigest>> {
+    let listeners = listeners_from_config(cfg)?;
+    let listener_ids = stable_listener_assignments(&listeners)?;
+    let map_data = MapData::from_pin(pin_path(cfg, CHASH_BUCKETS))
+        .with_context(|| format!("opening {CHASH_BUCKETS}"))?;
+    let map = Map::from_map_data(map_data)
+        .with_context(|| format!("{CHASH_BUCKETS} is not a hash map"))?;
+    let buckets: HashMap<MapData, NativeConsistentHashBucketKey, NativeConsistentHashBucketValue> =
+        HashMap::try_from(map)
+            .with_context(|| format!("{CHASH_BUCKETS} key/value layout mismatch"))?;
+    let mut by_listener: StdHashMap<u32, BTreeMap<u32, u32>> = StdHashMap::new();
+    for entry in buckets.iter() {
+        let (key, value) = entry.with_context(|| format!("iterating {CHASH_BUCKETS}"))?;
+        by_listener
+            .entry(key.listener_id)
+            .or_default()
+            .insert(key.bucket, value.target_id);
+    }
+
+    let mut out = Vec::new();
+    for (listener_id, listener) in listener_ids {
+        if listener.select != crate::config::LbSelect::ConsistentHash.code() {
+            continue;
+        }
+        let present = by_listener.remove(&listener_id).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(listener_id.to_be_bytes());
+        hasher.update(NATIVE_CONSISTENT_HASH_BUCKETS.to_be_bytes());
+        for bucket in 0..NATIVE_CONSISTENT_HASH_BUCKETS {
+            hasher.update(bucket.to_be_bytes());
+            let target_id = present.get(&bucket).copied().unwrap_or(u32::MAX);
+            hasher.update(target_id.to_be_bytes());
+        }
+        out.push(ConsistentHashBucketDigest {
+            listener_id,
+            listener_name: listener.name.clone(),
+            vip: listener.key.vip_ip.to_string(),
+            port: listener.key.vip_port,
+            protocol: native_protocol_name(listener.key.protocol),
+            bucket_count: NATIVE_CONSISTENT_HASH_BUCKETS,
+            digest: hex::encode(hasher.finalize()),
+        });
+    }
+    Ok(out)
+}
+
+fn native_protocol_name(protocol: crate::provider::native::NativeProtocol) -> &'static str {
+    match protocol {
+        crate::provider::native::NativeProtocol::Tcp => "tcp",
+        crate::provider::native::NativeProtocol::Udp => "udp",
+    }
 }
 
 /// A flow-table entry as exchanged with the HA peer. Field order is the wire
@@ -789,6 +963,7 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
     let listener_ids = stable_listener_assignments(&listeners)?;
     let observed = target_health_native(cfg).ok();
     sync_target_map(cfg, &listener_ids)?;
+    sync_consistent_hash_bucket_map(cfg, &listener_ids)?;
     refresh_listener_weights(cfg, &listeners, observed.as_ref())?;
     Ok(())
 }
@@ -891,6 +1066,16 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
             total.target_miss = total.target_miss.saturating_add(value.target_miss);
             total.rewritten = total.rewritten.saturating_add(value.rewritten);
             total.checksum_error = total.checksum_error.saturating_add(value.checksum_error);
+            total.chash_bucket_hit = total
+                .chash_bucket_hit
+                .saturating_add(value.chash_bucket_hit);
+            total.chash_bucket_miss = total
+                .chash_bucket_miss
+                .saturating_add(value.chash_bucket_miss);
+            total.chash_bucket_unusable = total
+                .chash_bucket_unusable
+                .saturating_add(value.chash_bucket_unusable);
+            total.chash_fallback = total.chash_fallback.saturating_add(value.chash_fallback);
             total
         },
     ))
@@ -1093,6 +1278,77 @@ mod tests {
                 .len(),
             first_ids.len()
         );
+    }
+
+    #[test]
+    fn consistent_hash_bucket_generation_tracks_health() {
+        let mut listener = listener(
+            [192, 0, 2, 10],
+            5060,
+            crate::provider::native::NativeProtocol::Udp,
+        );
+        listener.select = crate::config::LbSelect::ConsistentHash.code();
+        listener.targets = vec![
+            crate::provider::native::NativeTarget {
+                address: Ipv4Addr::new(192, 0, 2, 20),
+                port: 5060,
+                weight: 1,
+                state: crate::provider::native::NativeTargetState::Active,
+            },
+            crate::provider::native::NativeTarget {
+                address: Ipv4Addr::new(192, 0, 2, 21),
+                port: 5060,
+                weight: 1,
+                state: crate::provider::native::NativeTargetState::Active,
+            },
+        ];
+        let listener_ids = vec![(1, &listener)];
+
+        let desired = super::desired_consistent_hash_buckets(&listener_ids, None)
+            .expect("build buckets without observed health");
+        assert_eq!(
+            desired.len(),
+            edge_lb_common::NATIVE_CONSISTENT_HASH_BUCKETS as usize
+        );
+        assert!(desired.values().any(|value| value.target_id == 0));
+        assert!(desired.values().any(|value| value.target_id == 1));
+
+        let unhealthy = super::TargetHealthList {
+            entries: vec![crate::provider::native::TargetHealthEntry {
+                host_name: "192.0.2.20".to_string(),
+                name: "targets:192.0.2.20_udp_5060".to_string(),
+                target_group: "targets".to_string(),
+                current_state: Some("nok".to_string()),
+                ..crate::provider::native::TargetHealthEntry::default()
+            }],
+        };
+        let desired = super::desired_consistent_hash_buckets(&listener_ids, Some(&unhealthy))
+            .expect("build buckets with observed health");
+        assert_eq!(
+            desired.len(),
+            edge_lb_common::NATIVE_CONSISTENT_HASH_BUCKETS as usize
+        );
+        assert!(desired.values().all(|value| value.target_id == 1));
+    }
+
+    #[test]
+    fn consistent_hash_buckets_are_not_generated_for_other_selectors() {
+        let mut listener = listener(
+            [192, 0, 2, 10],
+            5060,
+            crate::provider::native::NativeProtocol::Udp,
+        );
+        listener.targets = vec![crate::provider::native::NativeTarget {
+            address: Ipv4Addr::new(192, 0, 2, 20),
+            port: 5060,
+            weight: 1,
+            state: crate::provider::native::NativeTargetState::Active,
+        }];
+        let listener_ids = vec![(1, &listener)];
+
+        let desired =
+            super::desired_consistent_hash_buckets(&listener_ids, None).expect("build buckets");
+        assert!(desired.is_empty());
     }
 
     /// Load the ingress classifier without attaching. Privileged only; on

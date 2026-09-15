@@ -273,7 +273,8 @@ backend binding alive while constructing the VXLAN specification.
 - gateway 仅完整 ACK（ack=true 且 version/response_nonce 非空）可以用空 conflicts 清除旧告警；不带版本/nonce 的心跳和空冲突 NACK 不代表新的健康观测。
 - backend 订阅与其 overlay 分配索引在同一个注册表锁内更新。断线清理必须匹配当前 stream_id，旧连接的退出或 ACK 不得修改新连接；TTL 清理同步删除两个索引，防止并发重连时遗留孤立节点。
 - 目标组保存弹窗只在 API 写入成功后关闭，失败保留输入与错误。保存后的列表刷新失败不能把已提交写入当作失败并诱导重复提交；保存路径只进行一轮页面刷新。
-- native 调度器支持 `rr`、`hash`、`priority`、`persist` 和 `lc`：`rr` 只在健康目标 slot 间轮询，不做权重展开；`hash` 使用内核 `bpf_get_hash_recalc(skb)` 的 skb hash 对目标 slot 取模；`priority` 按目标权重做加权轮询；`persist` 按客户端地址保持；`lc` 按活动 flow 数选择并轮转平局。未知选择器回退到 RR。`n2/n3` 不属于纯 TCP/UDP DNAT 数据面。
+- native 调度器支持 `rr`、`hash`、`consistent_hash`、`priority`、`persist` 和 `lc`：`rr` 只在健康目标 slot 间轮询，不做权重展开；`hash` 必须保留现有语义，使用内核 `bpf_get_hash_recalc(skb)` 的 skb hash 对目标 slot 取模，不得在原枚举上改成一致性 hash；`consistent_hash` 是独立策略，使用 edge-lb 自己定义的稳定流身份和用户态预计算的一致性桶表选择；`priority` 按目标权重做加权轮询；`persist` 按客户端地址保持；`lc` 按活动 flow 数选择并轮转平局。未知选择器回退到 RR。`n2/n3` 不属于纯 TCP/UDP DNAT 数据面。
+- `consistent_hash` 面向 SIP 等会话稳定场景。流身份只包含客户端 IPv4、客户端源端口、监听端口和协议，故意不包含 VIP；目标身份包含目标 IPv4 和目标端口。用户态按健康目标集合生成 1024 个 HRW/Rendezvous 一致性桶，bucket score 使用 64-bit 整数混合，eBPF 新流路径只计算流桶并查 `NATIVE_CHASH_BUCKETS`，然后二次校验 `NATIVE_TARGETS` 中目标仍 active/healthy。该策略只在 active/healthy 且未禁用的目标集合中选择，忽略权重数值；`weight = 0` 仍按不可选处理以兼容现有目标禁用语义。两台 gateway 只要配置、目标集合和健康观测一致，同一流身份必须选择同一 backend。目标增删或健康变化只允许导致一致性 hash 语义下的必要迁移。metrics 必须暴露实际 pinned bucket table 的 digest 以及 bucket hit/miss/unusable/fallback 计数，用于验证双 gateway 表一致和兜底路径是否异常。
 - native flow 命中任一方向时必须刷新正反两个 flow key 的 `last_seen_ns`，避免长连接单向活跃时另一方向提前过期；xSync 新建/删除走 ringbuf 事件，刷新状态通过低频差量 reconcile 同步，不做每包 refresh 事件。
 - native flow map 内部的 `last_seen_ns` 是本机 monotonic clock，只能在本机用于超时和新旧比较。xSync wire 层必须发送 `last_seen_age_ns`，接收端按本机 monotonic clock 还原 `last_seen_ns`；禁止跨 gateway 直接比较或复制绝对 monotonic 时间。
 - xSync 建立新的 gRPC session 并完成握手后，发送端必须清空本地 replica 索引并执行一次全量基线差量发送。接收端 ACK 的 `applied` 当前语义是“已被已挂载 datapath 接受的操作数”，幂等 no-op 也计数；发送端只有确认数等于本批发送操作数时才能推进 replica 索引。BACKUP native flow map 未挂载时不能把 0 变更误判为已同步。
@@ -288,4 +289,4 @@ backend binding alive while constructing the VXLAN specification.
   BFD promote 路径必须复用同一约束，不能绕过手动切换路径去触发完整
   datapath reconcile。
 - `lc` 的 active flow map 由 eBPF 在 flow 新建和显式删除时快速更新，同时由 gateway heal/xSync 兜底从 `NATIVE_FLOWS` 重算并删除过期 flow。不能只依赖 LRU map 被动淘汰，否则 active flow 计数不会自动回落。
-- `hash` 模式才允许调用 `bpf_get_hash_recalc(skb)`；`rr`、`priority`、`persist`、`lc` 不应为 skb hash helper 付出额外新 flow 开销。
+- `hash` 模式才允许调用 `bpf_get_hash_recalc(skb)`；`rr`、`consistent_hash`、`priority`、`persist`、`lc` 不应为 skb hash helper 付出额外新 flow 开销。`consistent_hash` 必须使用本项目内定义的纯整数 hash/mix 函数，不能依赖内核 skb hash 或每机随机 seed。

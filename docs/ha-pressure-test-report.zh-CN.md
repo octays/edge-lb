@@ -44,7 +44,7 @@
 
 - `scripts/edge-lb-ha-pressure.sh`：对指定 VIP 执行 TCP/UDP 压测，输出原始 TSV 和汇总统计。
 - `scripts/edge-lb-ha-failover-pressure.sh`：在压测过程中触发 HA 切换，并按切换前、切换中、切换后汇总结果。
-- `ha-bench`：Rust 实现的压测客户端，用真实 socket 往返耗时统计 RTT，不再包含 `sleep 1` 和 `nc` 自身等待行为。
+- `ha-bench`：Rust 实现的压测客户端，用真实 socket 往返耗时统计 RTT、源端口样本和后端分布，不再包含 `sleep 1` 和 `nc` 自身等待行为。
 
 实际执行时，压测流量运行在压测机上；主备切换由操作端通过当前 MASTER 的本机 API 触发。这样压测机只负责产生业务流量，不需要持有 gateway 的管理权限。
 
@@ -102,7 +102,7 @@ TCP 测试会在发送 payload 后关闭写方向，对齐 `nc -N` 的请求结�
 
 ### Rust 客户端基线压测
 
-`ha-bench` 不使用 `nc`，统计范围是一次 TCP/UDP 请求从发送到收到业务响应的真实 socket RTT。
+`ha-bench` 不使用 `nc`，统计范围是一次 TCP/UDP 请求从发送到收到业务响应的真实 socket RTT。summary 会输出去重源端口数 `source_ports`，原始 TSV 包含 `source_port` 列。
 
 执行命令：
 

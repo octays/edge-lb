@@ -1,8 +1,8 @@
 use std::{fmt, net::IpAddr, path::PathBuf};
 
 use edge_lb_common::{
-    NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY,
-    NATIVE_SELECT_RR,
+    NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST,
+    NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,8 @@ pub enum LbSelect {
     #[default]
     Rr,
     Hash,
+    #[serde(rename = "consistent_hash")]
+    ConsistentHash,
     Priority,
     Persist,
     Lc,
@@ -59,6 +61,7 @@ impl LbSelect {
         match self {
             Self::Rr => NATIVE_SELECT_RR,
             Self::Hash => NATIVE_SELECT_HASH,
+            Self::ConsistentHash => NATIVE_SELECT_CONSISTENT_HASH,
             Self::Priority => NATIVE_SELECT_PRIORITY,
             Self::Persist => NATIVE_SELECT_PERSIST,
             Self::Lc => NATIVE_SELECT_LC,
@@ -518,6 +521,8 @@ pub struct GatewayConfig {
     pub network: Option<NetworkConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<GatewayMetricsConfig>,
     /// Gateway overlay address derived from network.overlay_cidr.
     pub overlay_ip: String,
     /// TC priority of the gateway DSCP marker filter.
@@ -532,6 +537,7 @@ impl Default for GatewayConfig {
             control_plane: None,
             network: None,
             api: None,
+            metrics: None,
             overlay_ip: default_gateway_overlay(),
             dscp_pref: 1,
         }
@@ -565,6 +571,25 @@ impl Default for GatewayXdsConfig {
         Self {
             listen: "0.0.0.0:22222".to_string(),
             token: None,
+            trusted_source_cidrs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayMetricsConfig {
+    pub enabled: bool,
+    pub listen: String,
+    /// CIDRs allowed to scrape /metrics. Empty means derive the local underlay subnet.
+    pub trusted_source_cidrs: Vec<String>,
+}
+
+impl Default for GatewayMetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:19090".to_string(),
             trusted_source_cidrs: Vec::new(),
         }
     }

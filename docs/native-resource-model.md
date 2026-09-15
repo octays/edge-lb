@@ -51,12 +51,14 @@ ListenerConfig {
   target_port: u16             # 转发到目标组成员的端口
   protocols: ProtocolSet       # tcp、udp 或 tcp+udp
   target_group: string         # 必须引用已存在目标组
-  scheduler: rr | hash | priority | persist | lc
+  scheduler: rr | hash | consistent_hash | priority | persist | lc
   idle_timeout_secs: u32       # 默认 60
 }
 ```
 
 TCP+UDP 是一个资源、一个名称和一行 UI 展示，但数据面会投影成两条内部协议规则。修改监听端口或目标端口时，只修改监听配置，不修改目标组。
+
+`hash` 保留现有语义：使用内核 `skb` hash 对目标槽位取模，不改成一致性 hash。SIP 等要求重启后按同一流身份稳定回原后端的场景应使用独立的 `consistent_hash` 策略；该策略按客户端 IP、客户端源端口、监听端口和协议计算流身份，故意不包含 VIP，并在健康目标集合内通过 1024 个预计算一致性桶选择目标。bucket score 使用 64-bit 整数混合；gateway metrics 暴露实际 pinned bucket table digest 和 bucket hit/miss/unusable/fallback 计数。
 
 转发模式固定为 `default`，不进入管理模型。该模式保留客户端源 IP，后端回程通过 DSCP 对应的 VXLAN 回到 active gateway，再由 gateway 执行反向 NAT。
 

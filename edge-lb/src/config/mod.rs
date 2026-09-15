@@ -7,6 +7,7 @@
 //! [gateway.xds]                    # gateway control-plane listener
 //! [gateway.network]                # overlay/VXLAN/DSCP source
 //! [gateway.api]                    # gateway UI/API listener
+//! [gateway.metrics]                # gateway-only Prometheus metrics listener
 //! Runtime gateway/backend inventory is derived from local identity and xDS.
 //! Listener and target-group proxy config is persisted by the native datapath.
 //! [backend.xds]                    # backend control-plane subscription
@@ -37,9 +38,9 @@ pub use model::{
     ActiveSource, ApiConfig, BackendConfig, BackendControlConfig, BackendNode,
     BackendReturnPathConfig, BackendTarget, BackendXdsConfig, ControlPlaneConfig, ControlPlaneMode,
     DeviceDiscoveryRuntime, EDGE_MARK_BASE, EDGE_TABLE_BASE, FileConfig, GatewayConfig,
-    GatewayNode, GatewayReconcileConfig, GatewayReturnPath, GatewayXdsConfig, HaConfig,
-    IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSelect, Listener, NetworkConfig, NodeRole,
-    Protocol, RuntimeDiscovery, TargetGroup, gateway_slot, return_mark, return_table_id,
+    GatewayMetricsConfig, GatewayNode, GatewayReconcileConfig, GatewayReturnPath, GatewayXdsConfig,
+    HaConfig, IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSelect, Listener, NetworkConfig,
+    NodeRole, Protocol, RuntimeDiscovery, TargetGroup, gateway_slot, return_mark, return_table_id,
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/edge-lb/config.toml";
@@ -73,6 +74,13 @@ impl FileConfig {
     /// Validate invariants shared by every command.
     pub fn validate(&self) -> Result<()> {
         validate::validate(self)
+    }
+
+    pub(crate) fn validate_consistent_hash_listener_capacity(
+        &self,
+        listener_expansion_count: impl FnMut(&FileConfig, &Listener) -> Result<usize>,
+    ) -> Result<()> {
+        validate::validate_consistent_hash_listener_capacity(self, listener_expansion_count)
     }
 
     fn normalize_config(&mut self) {
@@ -542,6 +550,19 @@ mod tests {
             }),
             "192.0.2.20".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn lb_select_uses_consistent_hash_wire_name() {
+        assert_eq!(
+            serde_json::from_str::<LbSelect>("\"consistent_hash\"").unwrap(),
+            LbSelect::ConsistentHash
+        );
+        assert_eq!(
+            serde_json::to_string(&LbSelect::ConsistentHash).unwrap(),
+            "\"consistent_hash\""
+        );
+        assert!(serde_json::from_str::<LbSelect>("\"consistenthash\"").is_err());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use std::{collections::HashSet, net::IpAddr};
 
 use anyhow::{Context, Result, bail};
+use edge_lb_common::{NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_CONSISTENT_HASH_BUCKETS};
 
 use super::{
-    ActiveSource, ControlPlaneMode, FileConfig, NodeRole,
+    ActiveSource, ControlPlaneMode, FileConfig, LbSelect, Listener, NodeRole, Protocol,
     overlay::{parse_prefix, same_subnet, validate_overlay_capacity},
 };
 
@@ -221,6 +222,7 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
                 }
             }
         }
+        validate_consistent_hash_listener_capacity(file, configured_listener_expansion_count)?;
     }
 
     if let Some(token) = &file.api.auth_token
@@ -244,6 +246,19 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
         };
         if !loopback && file.api.auth_token.is_none() {
             bail!("gateway.api.auth_token is required when listening on non-loopback address");
+        }
+        if let Some(metrics) = &file.gateway.metrics {
+            if metrics.enabled {
+                let _listen: std::net::SocketAddr = metrics
+                    .listen
+                    .parse()
+                    .with_context(|| format!("bad gateway.metrics.listen {}", metrics.listen))?;
+            }
+            for cidr in &metrics.trusted_source_cidrs {
+                parse_prefix(cidr).with_context(|| {
+                    format!("bad gateway.metrics.trusted_source_cidrs entry {cidr:?}")
+                })?;
+            }
         }
     }
     if file.control_plane.enabled {
@@ -324,6 +339,49 @@ fn validate_native_listener(listener: &super::Listener) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn max_consistent_hash_datapath_listeners() -> usize {
+    (NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY / NATIVE_CONSISTENT_HASH_BUCKETS) as usize
+}
+
+pub(crate) fn validate_consistent_hash_listener_capacity(
+    file: &FileConfig,
+    mut listener_expansion_count: impl FnMut(&FileConfig, &Listener) -> Result<usize>,
+) -> Result<()> {
+    let max = max_consistent_hash_datapath_listeners();
+    let mut expanded = 0usize;
+    for listener in &file.listeners {
+        if listener.select != LbSelect::ConsistentHash {
+            continue;
+        }
+        expanded = expanded
+            .checked_add(listener_expansion_count(file, listener)?)
+            .context("consistent_hash listener expansion overflowed usize")?;
+    }
+    if expanded > max {
+        bail!(
+            "consistent_hash listener expansion uses {expanded} datapath listeners but native bucket map supports at most {max} ({} buckets each, {} map entries)",
+            NATIVE_CONSISTENT_HASH_BUCKETS,
+            NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY
+        );
+    }
+    Ok(())
+}
+
+fn configured_listener_expansion_count(file: &FileConfig, listener: &Listener) -> Result<usize> {
+    let mut vip_count = 1usize;
+    let mut explicit_vips = HashSet::new();
+    for vip in &listener.vip_ips {
+        if *vip != file.network.gateway_ip && explicit_vips.insert(*vip) {
+            vip_count += 1;
+        }
+    }
+    Ok(vip_count * unique_protocol_count(&listener.protocols))
+}
+
+pub(crate) fn unique_protocol_count(protocols: &[Protocol]) -> usize {
+    protocols.iter().copied().collect::<HashSet<_>>().len()
 }
 
 struct ProbeConfig<'a> {

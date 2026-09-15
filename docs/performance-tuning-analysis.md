@@ -77,7 +77,7 @@ Array 的单元素固定查找与端口集合查找不是同一问题。Array �
 
 ### 3.1 D1：不是补一次 lookup 就能解决的正确性问题
 
-- [源码] NATIVE_FLOWS 为 262144 项共享 LRU，每条逻辑连接通常占正反两项；理想容量约 131072 对，不是 262144 条完整连接。insert/remove/output 多处忽略返回值，没有建流提交状态。
+- [源码] NATIVE_FLOWS 为 1048576 项共享 LRU，每条逻辑连接通常占正反两项；理想容量约 524288 对，不是 1048576 条完整连接。insert/remove/output 多处忽略返回值，没有建流提交状态。
 - [推导] 同一首包并发处理可分别选择后端；两项写入非原子，LRU 可单项淘汰，留下不完整或相互不匹配的映射。共享 map 的单项替换原子不等于跨项事务。[Linux Hash/LRU map 文档](https://docs.kernel.org/bpf/map_hash.html)
 - [推导] 同一个客户端 IP/源端口访问两个 VIP 或监听端口，若映射到同一 backend IP/端口，反向五元组完全相同。reverse key 不携带原 VIP，BPF_ANY 会覆盖其归属，回包可能被改成另一监听的源地址。UDP 固定源端口可以构造此场景；单纯扩大 key、加入回包中不存在的字段不能解决识别问题。
 - [源码] GC 先收集过期 key 再删除，报文可在中间续期；LC 全量重算会覆盖同时发生的增量。再次读取只缩小竞争窗口，不是 CAS。
@@ -111,6 +111,8 @@ Array 的单元素固定查找与端口集合查找不是同一问题。Array �
 4. 同一路径两次 native_bump 可合并一次 stats lookup，属于低风险微优化，收益仍要 profile；保留 return_miss、insert/output failure 等诊断能力。
 5. map 容量先做预算与饱和测试再参数化；运行期扩容通常涉及对象替换，不可承诺无损。
 
+转发路径候选方案单独记录在 [forwarding-performance-options.md](forwarding-performance-options.md)，包括 veth、TC redirect、XDP 和 AF_XDP 的收益边界与验证顺序。此处不将任何 fast path 方案列为默认改造，仍要求先用 profile 和报文级压测证明瓶颈位置。
+
 ## 4. 调度算法与 DSCP
 
 源码：[调度及 marker](../edge-lb-ebpf/src/main.rs)、[调度 helper/test](../edge-lb-common/src/lib.rs)、[用户态权重](../edge-lb/src/linux/native_dnat.rs)。
@@ -119,11 +121,14 @@ Array 的单元素固定查找与端口集合查找不是同一问题。Array �
 | --- | --- | --- |
 | rr | 游标按全部槽位递增，再扫描可用槽位 | [推导] 槽位为健康/不健康/健康时，一轮选 0、2、2，健康目标并非等额 |
 | hash | skb hash 对槽位数取模；不可用时取首个健康槽 | 故障槽集中到首个健康目标；不是最少连接，也不是一致性 hash |
+| consistent_hash | 使用项目内稳定 flow hash 选择 1024 个预计算一致性桶；桶表由用户态基于健康目标和 64-bit HRW/Rendezvous 分数生成，流身份为客户端 IP、客户端源端口、监听端口和协议，不包含 VIP | 面向 SIP；保留现有 `hash` 不变；忽略权重，`weight=0` 仍视为不可选；eBPF 新流路径为常量查桶；metrics 暴露 bucket table digest 与 bucket hit/miss/unusable/fallback 计数；单测覆盖分布和目标增删迁移比例 |
 | priority | 游标在健康权重总和内选择区间 | 实际是加权轮询；测试权重更新与健康变化的发布一致性 |
 | persist | 客户端 IPv4 字节异或得到槽位和 fallback | 客户端粘性，不提供实时负载均衡；加载时强制使用默认 3h timeout，需与监听 idle timeout 文案统一 |
 | lc | 新流遍历目标、读活动 flow 数，游标打破平局 | 计的是 flow 生命周期，不是真实 ESTABLISHED；并发读改写和 GC 重算有竞争 |
 
-修正确性时不要未经评审更改所有算法语义。先测不健康槽分布、并发 RR/LC、权重零/边界、目标增删；hash/persist 的稳定性包含数组排序和 hash 输入，不能假设不同主机的 skb hash 一定相同。已建流靠 flow 复用而非每包重新调度。
+修正确性时不要未经评审更改所有算法语义。现有 `hash` 是兼容性语义，必须继续使用 skb hash 取模；一致性选择只能通过新增 `consistent_hash` 实现。先测不健康槽分布、并发 RR/LC、权重零/边界、目标增删；hash/persist 的稳定性包含数组排序和 hash 输入，不能假设不同主机的 skb hash 一定相同。已建流靠 flow 复用而非每包重新调度。
+
+2026-09-15 的 `consistent_hash` 高并发回归见 [high-concurrency-test-report-2026-09-11.md](high-concurrency-test-report-2026-09-11.md)：`concurrency=64`、`timeout=5000ms` 下 TCP 成功 CPS `8524.1`、默认 UDP socket 复用吞吐 `31377.7 req/s`，TCP/UDP 均 0 失败，active gateway 未记录 target miss、return miss 或 checksum error。默认 UDP 分布偏斜主要来自 `ha-bench` 复用 worker UDP socket，源端口样本有限；使用 `--udp-new-socket-per-request` 后去重源端口样本提升到 `55536`，UDP 分布约 `48.7% / 51.3%`，可用于判断真实多客户端源端口分布。
 
 健康目标索引、累积权重表可以在配置变化时构建，降低新建流扫描；只在目标数和 CPS 显示收益时实施。LC 的扫描成本只在新流发生，不能用它解释全部长连接 PPS。n2/n3 不纳入本轮。
 

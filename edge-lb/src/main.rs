@@ -12,6 +12,7 @@ mod control;
 mod events;
 mod install;
 mod linux;
+mod metrics;
 mod notify;
 mod provider;
 mod role;

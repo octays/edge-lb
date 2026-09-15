@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::File,
     io::{self, BufWriter, Read, Write},
@@ -57,6 +57,7 @@ enum TcpConnMode {
 struct Sample {
     ts_ms: u128,
     protocol: Protocol,
+    source_port: Option<u16>,
     ok: bool,
     latency_us: u128,
     backend: String,
@@ -69,6 +70,7 @@ struct Stats {
     ok: u64,
     fail: u64,
     latencies_us: Vec<u128>,
+    source_ports: BTreeSet<u16>,
     backends: BTreeMap<String, u64>,
     errors: BTreeMap<String, u64>,
 }
@@ -120,7 +122,7 @@ fn main() {
         let mut raw = raw.lock().expect("raw output mutex poisoned");
         writeln!(
             raw,
-            "timestamp_ms\tprotocol\tok\tlatency_us\tbackend\terror"
+            "timestamp_ms\tprotocol\tsource_port\tok\tlatency_us\tbackend\terror"
         )
         .expect("writing TSV header");
     }
@@ -214,8 +216,10 @@ fn run_tcp(addr: SocketAddr, cfg: &Config) -> Sample {
     let ts_ms = unix_ms();
     let mut response = Vec::new();
     let mut error = String::new();
+    let mut source_port = None;
 
     let result = TcpStream::connect_timeout(&addr, cfg.timeout).and_then(|mut stream| {
+        source_port = stream.local_addr().ok().map(|addr| addr.port());
         stream.set_read_timeout(Some(cfg.timeout))?;
         stream.set_write_timeout(Some(cfg.timeout))?;
         stream.write_all(&cfg.payload)?;
@@ -234,6 +238,7 @@ fn run_tcp(addr: SocketAddr, cfg: &Config) -> Sample {
         ts_ms,
         Protocol::Tcp,
         started,
+        source_port,
         &response,
         &error,
         &cfg.expect,
@@ -252,6 +257,9 @@ fn run_tcp_reused(addr: SocketAddr, cfg: &Config, stream: &mut Option<TcpStream>
         response.clear();
         result = send_tcp_reused_request(addr, cfg, stream, &mut response);
     }
+    let source_port = stream
+        .as_ref()
+        .and_then(|stream| stream.local_addr().ok().map(|addr| addr.port()));
     if let Err(err) = result {
         error = describe_io_error(&err);
         *stream = None;
@@ -261,6 +269,7 @@ fn run_tcp_reused(addr: SocketAddr, cfg: &Config, stream: &mut Option<TcpStream>
         ts_ms,
         Protocol::Tcp,
         started,
+        source_port,
         &response,
         &error,
         &cfg.expect,
@@ -313,8 +322,10 @@ fn run_udp(
     let ts_ms = unix_ms();
     let mut response = Vec::new();
     let mut error = String::new();
+    let mut source_port = None;
 
     let result = with_udp_socket(addr, cfg, socket, |socket| {
+        source_port = socket.local_addr().ok().map(|addr| addr.port());
         socket.send(&cfg.payload)?;
         let mut buf = [0u8; 4096];
         let n = socket.recv(&mut buf)?;
@@ -333,6 +344,7 @@ fn run_udp(
         ts_ms,
         Protocol::Udp,
         started,
+        source_port,
         &response,
         &error,
         &cfg.expect,
@@ -373,6 +385,7 @@ fn failed_sample(protocol: Protocol, error: String) -> Sample {
     Sample {
         ts_ms: unix_ms(),
         protocol,
+        source_port: None,
         ok: false,
         latency_us: 0,
         backend: "-".to_string(),
@@ -384,6 +397,7 @@ fn finish_sample(
     ts_ms: u128,
     protocol: Protocol,
     started: Instant,
+    source_port: Option<u16>,
     response: &[u8],
     error: &str,
     expect: &str,
@@ -393,6 +407,7 @@ fn finish_sample(
     Sample {
         ts_ms,
         protocol,
+        source_port,
         ok,
         latency_us: started.elapsed().as_micros(),
         backend: extract_private_ipv4(&body).unwrap_or("-").to_string(),
@@ -410,6 +425,9 @@ fn record_sample(stats: &mut BTreeMap<Protocol, Stats>, sample: &Sample) {
     let stats = stats.entry(sample.protocol).or_default();
     stats.total += 1;
     stats.latencies_us.push(sample.latency_us);
+    if let Some(port) = sample.source_port {
+        stats.source_ports.insert(port);
+    }
     if sample.ok {
         stats.ok += 1;
         *stats.backends.entry(sample.backend.clone()).or_default() += 1;
@@ -423,9 +441,13 @@ fn write_sample(raw: &Arc<Mutex<BufWriter<File>>>, sample: &Sample) {
     let mut raw = raw.lock().expect("raw output mutex poisoned");
     writeln!(
         raw,
-        "{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
         sample.ts_ms,
         protocol_name(sample.protocol),
+        sample
+            .source_port
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         u8::from(sample.ok),
         sample.latency_us,
         sample.backend,
@@ -441,6 +463,7 @@ fn merge_stats(target: &mut BTreeMap<Protocol, Stats>, source: BTreeMap<Protocol
         stats.ok += incoming.ok;
         stats.fail += incoming.fail;
         stats.latencies_us.append(&mut incoming.latencies_us);
+        stats.source_ports.append(&mut incoming.source_ports);
         for (backend, count) in incoming.backends {
             *stats.backends.entry(backend).or_default() += count;
         }
@@ -479,13 +502,14 @@ fn print_summary(cfg: &Config, stats: &BTreeMap<Protocol, Stats>) {
             stats.ok as f64 * 100.0 / stats.total as f64
         };
         println!(
-            "{} total={} ok={} fail={} success_rate={:.2}% rps={:.1} avg_ms={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+            "{} total={} ok={} fail={} success_rate={:.2}% rps={:.1} source_ports={} avg_ms={:.3} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
             protocol_name(*protocol),
             stats.total,
             stats.ok,
             stats.fail,
             success_rate,
             stats.total as f64 / elapsed,
+            stats.source_ports.len(),
             average_ms(&latencies),
             percentile_ms(&latencies, 50.0),
             percentile_ms(&latencies, 95.0),
@@ -767,14 +791,15 @@ fn usage() {
         "Usage: ha-bench [--target IP] [--port PORT] [--protocol tcp|udp|both] \\
          [--duration SECONDS] [--concurrency N] [--payload TEXT] \\
          [--timeout-ms MS] [--expect TEXT] [--udp-source-port PORT] \\
-         [--interval-us US|--interval-ms MS] [--tcp-reuse-conn] [--out FILE]\n\
+         [--interval-us US|--interval-ms MS] [--tcp-reuse-conn] \\
+         [--udp-new-socket-per-request] [--out FILE]\n\
          \n\
          Notes:\n\
            TCP opens a new connection per request by default and then shutdowns write, matching nc -N.\n\
            Use --tcp-reuse-conn to reuse one TCP connection per worker when the target supports multiple requests per connection.\n\
-           UDP reuses one socket per worker by default. Use --udp-new-socket-per-request to stress flow creation.\n\
+           UDP reuses one socket per worker by default. Use --udp-new-socket-per-request to increase source port samples and stress flow creation.\n\
            --udp-source-port is for hash stickiness checks and requires --concurrency 1.\n\
-           Without --udp-source-port, each UDP request uses an ephemeral source port."
+           Without --udp-source-port, UDP sockets bind ephemeral source ports according to the selected UDP socket mode."
     );
 }
 
@@ -828,6 +853,29 @@ mod tests {
         let new_socket_cfg = parse_args(vec!["--udp-new-socket-per-request".to_string()])
             .expect("udp socket mode should parse");
         assert_eq!(new_socket_cfg.udp_socket_mode, UdpSocketMode::NewPerRequest);
+    }
+
+    #[test]
+    fn stats_count_unique_source_ports() {
+        let mut stats = BTreeMap::new();
+        let mut sample = Sample {
+            ts_ms: 0,
+            protocol: Protocol::Udp,
+            source_port: Some(40000),
+            ok: true,
+            latency_us: 10,
+            backend: "192.168.0.13".to_string(),
+            error: String::new(),
+        };
+
+        record_sample(&mut stats, &sample);
+        record_sample(&mut stats, &sample);
+        sample.source_port = Some(40001);
+        record_sample(&mut stats, &sample);
+
+        let udp = stats.get(&Protocol::Udp).expect("udp stats should exist");
+        assert_eq!(udp.total, 3);
+        assert_eq!(udp.source_ports.len(), 2);
     }
 
     #[test]
