@@ -219,7 +219,7 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
             );
         }
     }
-    cfg.write_active_gateway(&target.name)?;
+    write_active_gateway_and_mark_dirty_if_changed(cfg, &target.name)?;
 
     let mut garp_announced = false;
     let mut vip_now_bound = false;
@@ -266,7 +266,7 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
 pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
     match event.state.trim().to_ascii_uppercase().as_str() {
         "MASTER" => {
-            cfg.write_active_gateway(&cfg.node_name)?;
+            write_active_gateway_and_mark_dirty_if_changed(cfg, &cfg.node_name)?;
             let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
             if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
                 apply_managed_hook_state_once(cfg, &ha_cfg, "MASTER", non_empty(&event.vip))?;
@@ -309,6 +309,25 @@ fn local_gateway_is_active(cfg: &Config) -> bool {
     cfg.active_gateway()
         .map(|gateway| gateway.name == cfg.node_name || gateway.underlay_ip == cfg.underlay_ip)
         .unwrap_or(false)
+}
+
+pub(crate) fn write_active_gateway_and_mark_dirty_if_changed(
+    cfg: &Config,
+    gateway: &str,
+) -> Result<()> {
+    let before = cfg
+        .active_gateway()
+        .ok()
+        .map(|gateway| gateway.name.clone());
+    cfg.write_active_gateway(gateway)?;
+    let after = cfg
+        .active_gateway()
+        .ok()
+        .map(|gateway| gateway.name.clone());
+    if before != after {
+        crate::provider::native::mark_state_dirty();
+    }
+    Ok(())
 }
 
 fn apply_managed_hook_state_once(
@@ -475,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_active_gateway_does_not_mark_native_proxy_dirty() {
+    fn switch_active_gateway_marks_native_proxy_dirty_when_owner_changes() {
         let (cfg, dir) = test_gateway_config("switch");
         save_hook_ha_config(&dir);
         fs::write(&cfg.ha.active_state_file, "gateway-b\n").unwrap();
@@ -485,7 +504,7 @@ mod tests {
 
         assert_eq!(result.gateway, "gateway-a");
         assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
-        assert!(!take_state_dirty());
+        assert!(take_state_dirty());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -523,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn ka_hook_active_events_do_not_mark_native_proxy_dirty() {
+    fn ka_hook_active_events_mark_native_proxy_dirty_when_owner_changes() {
         reset_test_hooks();
         let (cfg, dir) = test_gateway_config("ka-hook");
         save_hook_ha_config(&dir);
@@ -541,7 +560,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
-        assert!(!take_state_dirty());
+        assert!(take_state_dirty());
         fs::remove_dir_all(dir).ok();
     }
 

@@ -232,9 +232,7 @@ pub fn run(cfg: &Config) -> Result<()> {
             DscpUpdate::Replace(attachment) => Some(attachment),
             DscpUpdate::Keep | DscpUpdate::Clear => None,
         };
-    if let Err(error) = native::flow_persistence::restore_on_start(&cfg) {
-        tracing::warn!("[gateway] native flow restore skipped: {error:#}");
-    }
+    let mut flow_restore_done = false;
     // Reconcile startup templates after the same bounded subscription settle
     // window as node changes, not before the xDS server has started.
     let mut cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
@@ -243,7 +241,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     crate::runtime::proxy_replication::spawn(&cfg)?;
     spawn_probe_worker(&cfg);
     spawn_flow_sync_worker(&cfg);
-    let _flow_persistence_worker = native::flow_persistence::spawn_worker(&cfg)?;
+    let mut _flow_persistence_worker = None;
     crate::runtime::bfd::spawn(&cfg);
     control::spawn_gateway(&cfg);
     tracing::info!(
@@ -268,8 +266,13 @@ pub fn run(cfg: &Config) -> Result<()> {
     let mut pending_node_change = Some(Instant::now());
     while !shutdown::requested() {
         let mut needs_full = false;
-        if let Err(error) = native::ha::reconcile_vip(&cfg) {
-            tracing::warn!("[gateway] HA VIP reconcile skipped: {error:#}");
+        match native::ha::reconcile_vip(&cfg) {
+            Ok(true) => {
+                needs_full = true;
+                tracing::info!("[gateway] HA VIP state changed; reconciling datapath");
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!("[gateway] HA VIP reconcile skipped: {error:#}"),
         }
         match control::merge_active_backend_subscriptions(&mut cfg) {
             Ok(true) => {
@@ -330,13 +333,18 @@ pub fn run(cfg: &Config) -> Result<()> {
                 Ok(DscpUpdate::Replace(attachment)) => {
                     dscp_attachment = Some(attachment);
                     cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                    maybe_restore_native_flows(&cfg, &mut flow_restore_done);
+                    maybe_start_flow_persistence_worker(&cfg, &mut _flow_persistence_worker)?;
                 }
                 Ok(DscpUpdate::Clear) => {
                     dscp_attachment = None;
                     cached_dscp_ports.clear();
+                    maybe_start_flow_persistence_worker(&cfg, &mut _flow_persistence_worker)?;
                 }
                 Ok(DscpUpdate::Keep) => {
                     cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                    maybe_restore_native_flows(&cfg, &mut flow_restore_done);
+                    maybe_start_flow_persistence_worker(&cfg, &mut _flow_persistence_worker)?;
                 }
                 Err(e) => tracing::error!("[gateway] apply failed: {e:#}"),
             }
@@ -356,14 +364,28 @@ pub fn run(cfg: &Config) -> Result<()> {
                                 dscp_attachment = Some(attachment);
                                 cached_dscp_ports =
                                     AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                                maybe_restore_native_flows(&cfg, &mut flow_restore_done);
+                                maybe_start_flow_persistence_worker(
+                                    &cfg,
+                                    &mut _flow_persistence_worker,
+                                )?;
                             }
                             Ok(DscpUpdate::Clear) => {
                                 dscp_attachment = None;
                                 cached_dscp_ports.clear();
+                                maybe_start_flow_persistence_worker(
+                                    &cfg,
+                                    &mut _flow_persistence_worker,
+                                )?;
                             }
                             Ok(DscpUpdate::Keep) => {
                                 cached_dscp_ports =
                                     AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
+                                maybe_restore_native_flows(&cfg, &mut flow_restore_done);
+                                maybe_start_flow_persistence_worker(
+                                    &cfg,
+                                    &mut _flow_persistence_worker,
+                                )?;
                             }
                             Err(e) => {
                                 tracing::error!("[gateway] apply after automation failed: {e:#}")
@@ -385,6 +407,30 @@ pub fn run(cfg: &Config) -> Result<()> {
     dscp::detach(&cfg, &cfg.network().underlay_dev).ok();
     drop(dscp_attachment);
     crate::linux::native_dnat::cleanup(&cfg).ok();
+    Ok(())
+}
+
+fn maybe_restore_native_flows(cfg: &Config, done: &mut bool) {
+    if *done {
+        return;
+    }
+    match native::flow_persistence::restore_on_start(cfg) {
+        Ok(Some(_)) => *done = true,
+        Ok(None) => {}
+        Err(error) => {
+            *done = true;
+            tracing::warn!("[gateway] native flow restore skipped: {error:#}");
+        }
+    }
+}
+
+fn maybe_start_flow_persistence_worker(
+    cfg: &Config,
+    worker: &mut Option<std::thread::JoinHandle<()>>,
+) -> Result<()> {
+    if worker.is_none() {
+        *worker = native::flow_persistence::spawn_worker(cfg)?;
+    }
     Ok(())
 }
 

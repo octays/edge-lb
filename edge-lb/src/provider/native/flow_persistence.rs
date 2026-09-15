@@ -124,11 +124,21 @@ pub fn restore_on_start(cfg: &Config) -> Result<Option<RestoreSummary>> {
     if !settings.enabled || !settings.restore_on_start {
         return Ok(None);
     }
+    if !is_active_gateway(cfg) {
+        tracing::debug!("[flow-persist] delaying native flow restore until this gateway is active");
+        return Ok(None);
+    }
     let path = snapshot_path(cfg);
     if !path.exists() {
         tracing::debug!(
             "[flow-persist] no native flow snapshot at {}",
             path.display()
+        );
+        return Ok(None);
+    }
+    if !has_restore_candidates(cfg)? {
+        tracing::debug!(
+            "[flow-persist] delaying native flow restore until listener targets are available"
         );
         return Ok(None);
     }
@@ -166,6 +176,13 @@ pub fn restore_on_start(cfg: &Config) -> Result<Option<RestoreSummary>> {
             Err(error)
         }
     }
+}
+
+fn has_restore_candidates(cfg: &Config) -> Result<bool> {
+    let mut runtime_cfg = cfg.clone();
+    crate::provider::native::hydrate_proxy_config_from_api(&mut runtime_cfg)
+        .context("loading canonical proxy configuration for flow restore preflight")?;
+    Ok(!listeners_from_config(&runtime_cfg)?.is_empty())
 }
 
 pub fn flush_on_shutdown(cfg: &Config) {
@@ -211,8 +228,26 @@ pub fn write_snapshot(cfg: &Config) -> Result<Option<SnapshotSummary>> {
         config_digest: digest,
         entries: snapshot_entries_from_pairs(&pairs),
     };
-    let bytes = encode_snapshot(&snapshot)?;
     let path = snapshot_path(&runtime_cfg);
+    if pairs.is_empty() && path.exists() {
+        let summary = SnapshotSummary {
+            records: 0,
+            bytes: fs::metadata(&path)
+                .map(|meta| meta.len())
+                .unwrap_or_default(),
+            duration: started.elapsed(),
+        };
+        set_status(|status| {
+            status.snapshot_records = summary.records;
+            status.snapshot_bytes = summary.bytes;
+            status.snapshot_duration_ms = millis(summary.duration);
+        });
+        tracing::debug!(
+            "[flow-persist] keeping existing native flow snapshot because current flow map is empty"
+        );
+        return Ok(Some(summary));
+    }
+    let bytes = encode_snapshot(&snapshot)?;
     write_atomic(&path, &bytes)?;
     let summary = SnapshotSummary {
         records: pairs.len(),
@@ -260,7 +295,7 @@ fn restore_from_path(cfg: &Config, path: &Path) -> Result<RestoreSummary> {
             runtime_cfg.node_name
         );
     }
-    let listener_index = listener_index(&listeners)?;
+    let listener_index = ListenerRestoreIndex::new(&listeners)?;
     let elapsed_ns = unix_elapsed_ns(snapshot.saved_at_unix_ns, unix_now_ns());
     let pairs = collect_restore_pairs(&snapshot.entries);
     let mut summary = RestoreSummary::default();
@@ -296,6 +331,12 @@ fn restore_from_path(cfg: &Config, path: &Path) -> Result<RestoreSummary> {
 
 fn settings(cfg: &Config) -> GatewayFlowPersistenceConfig {
     cfg.gateway.flow_persistence.clone().unwrap_or_default()
+}
+
+fn is_active_gateway(cfg: &Config) -> bool {
+    cfg.active_gateway()
+        .map(|gateway| gateway.name == cfg.node_name || gateway.underlay_ip == cfg.underlay_ip)
+        .unwrap_or(true)
 }
 
 fn snapshot_path(cfg: &Config) -> PathBuf {
@@ -401,38 +442,94 @@ fn forward_reverse_keys(
     }
 }
 
-fn listener_index<'a>(listeners: &'a [NativeListener]) -> Result<HashMap<u32, &'a NativeListener>> {
-    let mut out = HashMap::new();
-    for (listener_id, listener) in native_dnat::stable_listener_assignments(listeners)? {
-        out.insert(listener_id, listener);
+#[derive(Clone, Copy)]
+struct ListenerRuntimeRef<'a> {
+    listener_id: u32,
+    listener: &'a NativeListener,
+}
+
+struct ListenerRestoreIndex<'a> {
+    by_id: HashMap<u32, ListenerRuntimeRef<'a>>,
+    by_socket: HashMap<(u32, u16, u8), ListenerRuntimeRef<'a>>,
+}
+
+impl<'a> ListenerRestoreIndex<'a> {
+    fn new(listeners: &'a [NativeListener]) -> Result<Self> {
+        let mut by_id = HashMap::new();
+        let mut by_socket = HashMap::new();
+        for (listener_id, listener) in native_dnat::stable_listener_assignments(listeners)? {
+            let entry = ListenerRuntimeRef {
+                listener_id,
+                listener,
+            };
+            by_id.insert(listener_id, entry);
+            by_socket.insert(
+                (
+                    ipv4_to_u32(listener.key.vip_ip),
+                    listener.key.vip_port.to_be(),
+                    listener.key.protocol.ip_proto(),
+                ),
+                entry,
+            );
+        }
+        Ok(Self { by_id, by_socket })
     }
-    Ok(out)
+
+    fn get(
+        &self,
+        old_listener_id: u32,
+        forward_key: NativeFlowKey,
+        value: NativeFlowValue,
+    ) -> Option<ListenerRuntimeRef<'a>> {
+        if let Some(entry) = self.by_id.get(&old_listener_id).copied()
+            && listener_matches(entry.listener, forward_key, value)
+        {
+            return Some(entry);
+        }
+        self.by_socket
+            .get(&(value.vip, value.vip_port, forward_key.proto))
+            .copied()
+            .filter(|entry| listener_matches(entry.listener, forward_key, value))
+    }
+}
+
+fn listener_matches(
+    listener: &NativeListener,
+    forward_key: NativeFlowKey,
+    value: NativeFlowValue,
+) -> bool {
+    ipv4_to_u32(listener.key.vip_ip) == value.vip
+        && listener.key.vip_port.to_be() == value.vip_port
+        && forward_key.dst == value.vip
+        && forward_key.dport == value.vip_port
+        && forward_key.proto == listener.key.protocol.ip_proto()
 }
 
 fn remap_value(
     value: NativeFlowValue,
     restored_age_ns: u64,
     forward_key: NativeFlowKey,
-    listeners: &HashMap<u32, &NativeListener>,
+    listeners: &ListenerRestoreIndex<'_>,
 ) -> Option<NativeFlowValue> {
-    let listener = listeners.get(&value.listener_id)?;
-    if ipv4_to_u32(listener.key.vip_ip) != value.vip {
-        return None;
-    }
-    if listener.key.vip_port.to_be() != value.vip_port {
-        return None;
-    }
-    if forward_key.dst != value.vip
-        || forward_key.dport != value.vip_port
-        || forward_key.proto != listener.key.protocol.ip_proto()
-    {
-        return None;
-    }
-    let target_id = listener.targets.iter().position(|target| {
-        ipv4_to_u32(target.address) == value.target && target.port == value.target_port
-    })?;
+    let listener = listeners.get(value.listener_id, forward_key, value)?;
+    let target_id = listener
+        .listener
+        .targets
+        .iter()
+        .position(|target| {
+            ipv4_to_u32(target.address) == value.target && target.port == value.target_port
+        })
+        .or_else(|| {
+            let target_id = usize::try_from(value.target_id).ok()?;
+            let target = listener.listener.targets.get(target_id)?;
+            (target.port == value.target_port).then_some(target_id)
+        })?;
+    let target = listener.listener.targets.get(target_id)?;
     Some(NativeFlowValue {
+        listener_id: listener.listener_id,
         target_id: target_id as u32,
+        target: ipv4_to_u32(target.address),
+        target_port: target.port,
         last_seen_ns: native_dnat::monotonic_now_ns().saturating_sub(restored_age_ns),
         ..value
     })
@@ -859,11 +956,68 @@ mod tests {
                 },
             ],
         };
-        let mut listeners = HashMap::new();
-        listeners.insert(7, &listener);
+        let listeners = ListenerRestoreIndex {
+            by_id: HashMap::from([(
+                7,
+                ListenerRuntimeRef {
+                    listener_id: 7,
+                    listener: &listener,
+                },
+            )]),
+            by_socket: HashMap::new(),
+        };
 
         let remapped = remap_value(value, 10, forward, &listeners).unwrap();
         assert_eq!(remapped.target_id, 1);
+        assert_eq!(remapped.target, ipv4_to_u32(Ipv4Addr::new(192, 0, 2, 20)));
+    }
+
+    #[test]
+    fn restore_remaps_cross_gateway_target_address_by_target_id() {
+        let (forward, mut value) = flow_entry(40000, 90);
+        value.target_id = 1;
+        value.target = ipv4_to_u32(Ipv4Addr::new(10, 255, 15, 3));
+        let listener = NativeListener {
+            name: "sip".to_string(),
+            target_group: "sip-targets".to_string(),
+            key: NativeListenerKey {
+                vip_ip: Ipv4Addr::new(192, 0, 2, 10),
+                vip_port: 5060,
+                protocol: NativeProtocol::Udp,
+            },
+            select: 0,
+            inactive_timeout_secs: 240,
+            dscp: 46,
+            targets: vec![
+                NativeTarget {
+                    address: Ipv4Addr::new(10, 255, 16, 2),
+                    port: 5060,
+                    weight: 1,
+                    state: Default::default(),
+                },
+                NativeTarget {
+                    address: Ipv4Addr::new(10, 255, 16, 3),
+                    port: 5060,
+                    weight: 1,
+                    state: Default::default(),
+                },
+            ],
+        };
+        let listeners = ListenerRestoreIndex {
+            by_id: HashMap::from([(
+                7,
+                ListenerRuntimeRef {
+                    listener_id: 7,
+                    listener: &listener,
+                },
+            )]),
+            by_socket: HashMap::new(),
+        };
+
+        let remapped = remap_value(value, 10, forward, &listeners).unwrap();
+        assert_eq!(remapped.target_id, 1);
+        assert_eq!(remapped.target, ipv4_to_u32(Ipv4Addr::new(10, 255, 16, 3)));
+        assert_eq!(remapped.target_port, 5060);
     }
 
     #[test]
@@ -887,9 +1041,55 @@ mod tests {
                 state: Default::default(),
             }],
         };
-        let mut listeners = HashMap::new();
-        listeners.insert(7, &listener);
+        let listeners = ListenerRestoreIndex {
+            by_id: HashMap::from([(
+                7,
+                ListenerRuntimeRef {
+                    listener_id: 7,
+                    listener: &listener,
+                },
+            )]),
+            by_socket: HashMap::new(),
+        };
 
         assert!(remap_value(value, 10, forward, &listeners).is_none());
+    }
+
+    #[test]
+    fn restore_can_remap_listener_id_from_socket_identity() {
+        let (forward, mut value) = flow_entry(40000, 90);
+        value.listener_id = 99;
+        let listener = NativeListener {
+            name: "sip".to_string(),
+            target_group: "sip-targets".to_string(),
+            key: NativeListenerKey {
+                vip_ip: Ipv4Addr::new(192, 0, 2, 10),
+                vip_port: 5060,
+                protocol: NativeProtocol::Udp,
+            },
+            select: 0,
+            inactive_timeout_secs: 240,
+            dscp: 46,
+            targets: vec![NativeTarget {
+                address: Ipv4Addr::new(192, 0, 2, 20),
+                port: 5060,
+                weight: 1,
+                state: Default::default(),
+            }],
+        };
+        let listeners = ListenerRestoreIndex {
+            by_id: HashMap::new(),
+            by_socket: HashMap::from([(
+                (value.vip, value.vip_port, forward.proto),
+                ListenerRuntimeRef {
+                    listener_id: 7,
+                    listener: &listener,
+                },
+            )]),
+        };
+
+        let remapped = remap_value(value, 10, forward, &listeners).unwrap();
+        assert_eq!(remapped.listener_id, 7);
+        assert_eq!(remapped.target_id, 0);
     }
 }

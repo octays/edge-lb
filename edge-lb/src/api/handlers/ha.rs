@@ -350,7 +350,10 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     if local.name != cfg.node_name && local.underlay_ip != cfg.underlay_ip {
         return Reply::error(409, "activation target is not this gateway");
     }
-    if let Err(e) = cfg.write_active_gateway(&cfg.node_name) {
+    if let Err(e) = crate::provider::native::ha::write_active_gateway_and_mark_dirty_if_changed(
+        cfg,
+        &cfg.node_name,
+    ) {
         return Reply::error(500, format!("writing active gateway: {e:#}"));
     }
     let ha_cfg = match ha::load_for_state_dir(Path::new(&*cfg.state_dir)) {
