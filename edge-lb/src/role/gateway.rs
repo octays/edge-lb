@@ -232,6 +232,9 @@ pub fn run(cfg: &Config) -> Result<()> {
             DscpUpdate::Replace(attachment) => Some(attachment),
             DscpUpdate::Keep | DscpUpdate::Clear => None,
         };
+    if let Err(error) = native::flow_persistence::restore_on_start(&cfg) {
+        tracing::warn!("[gateway] native flow restore skipped: {error:#}");
+    }
     // Reconcile startup templates after the same bounded subscription settle
     // window as node changes, not before the xDS server has started.
     let mut cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
@@ -240,6 +243,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     crate::runtime::proxy_replication::spawn(&cfg)?;
     spawn_probe_worker(&cfg);
     spawn_flow_sync_worker(&cfg);
+    let _flow_persistence_worker = native::flow_persistence::spawn_worker(&cfg)?;
     crate::runtime::bfd::spawn(&cfg);
     control::spawn_gateway(&cfg);
     tracing::info!(
@@ -377,6 +381,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     if let Err(error) = native::ha::handoff_or_release_on_shutdown(&cfg) {
         tracing::warn!("[gateway] HA shutdown handoff skipped: {error:#}");
     }
+    native::flow_persistence::flush_on_shutdown(&cfg);
     dscp::detach(&cfg, &cfg.network().underlay_dev).ok();
     drop(dscp_attachment);
     crate::linux::native_dnat::cleanup(&cfg).ok();

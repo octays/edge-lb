@@ -38,9 +38,10 @@ pub use model::{
     ActiveSource, ApiConfig, BackendConfig, BackendControlConfig, BackendNode,
     BackendReturnPathConfig, BackendTarget, BackendXdsConfig, ControlPlaneConfig, ControlPlaneMode,
     DeviceDiscoveryRuntime, EDGE_MARK_BASE, EDGE_TABLE_BASE, FileConfig, GatewayConfig,
-    GatewayMetricsConfig, GatewayNode, GatewayReconcileConfig, GatewayReturnPath, GatewayXdsConfig,
-    HaConfig, IpDiscoveryConfig, IpDiscoveryRuntime, LbMode, LbSelect, Listener, NetworkConfig,
-    NodeRole, Protocol, RuntimeDiscovery, TargetGroup, gateway_slot, return_mark, return_table_id,
+    GatewayFlowPersistenceConfig, GatewayMetricsConfig, GatewayNode, GatewayReconcileConfig,
+    GatewayReturnPath, GatewayXdsConfig, HaConfig, IpDiscoveryConfig, IpDiscoveryRuntime, LbMode,
+    LbSelect, Listener, NetworkConfig, NodeRole, Protocol, RuntimeDiscovery, TargetGroup,
+    gateway_slot, return_mark, return_table_id,
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/edge-lb/config.toml";

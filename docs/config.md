@@ -21,6 +21,7 @@ sudo systemctl restart edge-lb
 | `[gateway.network]` | yes | no | overlay/VXLAN/DSCP 全局参数源 |
 | `[gateway.api]` | yes | no | 管理 API/UI，gateway 必须启用 |
 | `[gateway.metrics]` | yes | no | gateway-only Prometheus metrics 独立端口，默认关闭 |
+| `[gateway.flow_persistence]` | yes | no | gateway-only native flow map 本地快照，默认关闭 |
 | `[gateway.network]` | yes | no | native VXLAN、overlay 和 DSCP 参数 |
 | `[backend.xds]` | no | yes | backend 连接 gateway 控制面 |
 | `[backend.return_path]` | no | yes | backend 本机 nft、策略路由、MSS 参数 |
@@ -59,6 +60,23 @@ metrics 只在 gateway daemon 中启动，backend 不提供 metrics HTTP 端口�
 `GET /metrics`，不属于 `/api/v1`，也不使用 Bearer token。`trusted_source_cidrs`
 为空数组时只允许本机 `underlay_dev` 所在接口网段；如果需要本机 Prometheus 通过
 `127.0.0.1` 抓取，需要显式加入 `127.0.0.1/32`。
+
+gateway 可通过 `[gateway.flow_persistence]` 启用 native flow map 本地快照：
+
+```toml
+[gateway.flow_persistence]
+enabled = false
+interval_secs = 30
+min_remaining_ttl_secs = 5
+max_records = 524288
+restore_on_start = true
+flush_on_shutdown = true
+```
+
+该能力只在 gateway 生效，默认关闭。开启后后台周期性将 pinned `NATIVE_FLOWS`
+写入 `state_dir/native-flows.snapshot`，启动时在 native datapath reconcile 后恢复仍未过期、
+仍匹配当前 listener/target endpoint 的 flow pair。快照保存 age/TTL 语义，不保存本机
+monotonic `last_seen_ns` 绝对值；恢复时会按当前配置重新映射 `target_id`。
 
 ## Gateway HA 与 VIP
 

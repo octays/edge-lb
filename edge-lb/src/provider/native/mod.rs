@@ -6,6 +6,7 @@
 //! instead of manipulating maps directly.
 
 mod api_model;
+pub mod flow_persistence;
 pub mod ha;
 mod model;
 pub mod probe;

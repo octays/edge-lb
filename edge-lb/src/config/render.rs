@@ -90,6 +90,27 @@ fn render_gateway_sections(file: &FileConfig, out: &mut String) {
         metrics.trusted_source_cidrs
     ));
     out.push('\n');
+
+    let flow_persistence = file.gateway.flow_persistence.clone().unwrap_or_default();
+    out.push_str("[gateway.flow_persistence]\n");
+    out.push_str(&format!("enabled = {}\n", flow_persistence.enabled));
+    out.push_str(&format!(
+        "interval_secs = {}\n",
+        flow_persistence.interval_secs
+    ));
+    out.push_str(&format!(
+        "min_remaining_ttl_secs = {}\n",
+        flow_persistence.min_remaining_ttl_secs
+    ));
+    out.push_str(&format!("max_records = {}\n", flow_persistence.max_records));
+    out.push_str(&format!(
+        "restore_on_start = {}\n",
+        flow_persistence.restore_on_start
+    ));
+    out.push_str(&format!(
+        "flush_on_shutdown = {}\n\n",
+        flow_persistence.flush_on_shutdown
+    ));
 }
 
 fn render_backend_sections(file: &FileConfig, out: &mut String) {

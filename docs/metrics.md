@@ -90,6 +90,15 @@ rate(edge_lb_process_cpu_seconds_total[1m]) / edge_lb_host_cpu_cores
 | `edge_lb_gateway_native_consistent_hash_bucket_unusable_total` | counter | bucket 指向的 target 当前不可用或越界的次数。 |
 | `edge_lb_gateway_native_consistent_hash_fallback_total` | counter | `consistent_hash` 因 bucket miss/unusable 回退到首个可用 target 的次数。 |
 | `edge_lb_gateway_native_consistent_hash_bucket_table_info{listener,listener_id,vip,port,protocol,bucket_count,digest}` | gauge | 实际 pinned bucket table 的摘要信息，值固定为 `1`，用于比对双 gateway 是否生成同一张表。 |
+| `edge_lb_gateway_native_flow_persistence_enabled` | gauge | native flow map 本地快照是否开启，`1` 表示开启。 |
+| `edge_lb_gateway_native_flow_snapshot_records` | gauge | 最近一次成功写入的 canonical flow pair 数。 |
+| `edge_lb_gateway_native_flow_snapshot_bytes` | gauge | 最近一次成功写入的 snapshot 文件大小。 |
+| `edge_lb_gateway_native_flow_snapshot_duration_seconds` | gauge | 最近一次 snapshot 的 dump、编码和落盘耗时。 |
+| `edge_lb_gateway_native_flow_snapshot_errors_total` | counter | snapshot 写入失败次数。 |
+| `edge_lb_gateway_native_flow_restore_records_total` | counter | 启动恢复成功写回的 canonical flow pair 数。 |
+| `edge_lb_gateway_native_flow_restore_skipped_total{reason}` | counter | 启动恢复跳过的 flow pair 数，reason 包括 `expired`、`config`、`incomplete`。 |
+| `edge_lb_gateway_native_flow_restore_duration_seconds` | gauge | 最近一次启动恢复耗时。 |
+| `edge_lb_gateway_native_flow_restore_errors_total` | counter | 启动恢复失败次数。 |
 
 常用 PromQL：
 
@@ -100,6 +109,8 @@ rate(edge_lb_gateway_native_target_miss_total[1m])
 rate(edge_lb_gateway_native_checksum_error_total[1m])
 rate(edge_lb_gateway_native_consistent_hash_fallback_total[1m])
 edge_lb_gateway_native_consistent_hash_bucket_table_info
+edge_lb_gateway_native_flow_snapshot_records
+rate(edge_lb_gateway_native_flow_snapshot_errors_total[5m])
 ```
 
 ## 采集开销

@@ -722,7 +722,7 @@ fn open_pinned_flows(
     Ok(Some(flows))
 }
 
-fn stable_listener_assignments(
+pub(crate) fn stable_listener_assignments(
     listeners: &[crate::provider::native::NativeListener],
 ) -> Result<Vec<(u32, &crate::provider::native::NativeListener)>> {
     if listeners.len() > NATIVE_LISTENER_ID_CAPACITY as usize {
@@ -900,7 +900,7 @@ pub(crate) fn monotonic_now_ns() -> u64 {
         .saturating_add(ts.tv_nsec as u64)
 }
 
-fn canonical_flow_pair(
+pub(crate) fn canonical_flow_pair(
     key: edge_lb_common::NativeFlowKey,
     value: edge_lb_common::NativeFlowValue,
 ) -> (edge_lb_common::NativeFlowKey, edge_lb_common::NativeFlowKey) {

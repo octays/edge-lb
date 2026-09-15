@@ -523,6 +523,8 @@ pub struct GatewayConfig {
     pub api: Option<ApiConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<GatewayMetricsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_persistence: Option<GatewayFlowPersistenceConfig>,
     /// Gateway overlay address derived from network.overlay_cidr.
     pub overlay_ip: String,
     /// TC priority of the gateway DSCP marker filter.
@@ -538,6 +540,7 @@ impl Default for GatewayConfig {
             network: None,
             api: None,
             metrics: None,
+            flow_persistence: None,
             overlay_ip: default_gateway_overlay(),
             dscp_pref: 1,
         }
@@ -591,6 +594,31 @@ impl Default for GatewayMetricsConfig {
             enabled: false,
             listen: "127.0.0.1:19090".to_string(),
             trusted_source_cidrs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GatewayFlowPersistenceConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub min_remaining_ttl_secs: u64,
+    /// Maximum canonical bidirectional flow pairs retained in one snapshot.
+    pub max_records: usize,
+    pub restore_on_start: bool,
+    pub flush_on_shutdown: bool,
+}
+
+impl Default for GatewayFlowPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 30,
+            min_remaining_ttl_secs: 5,
+            max_records: 524_288,
+            restore_on_start: true,
+            flush_on_shutdown: true,
         }
     }
 }

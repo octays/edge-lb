@@ -1,20 +1,20 @@
 # native flow map 持久化调研
 
-本文记录 `NATIVE_FLOWS` 持久化的可行性、边界和推荐实现路径。目标是让 gateway
+本文记录 `NATIVE_FLOWS` 持久化的可行性、边界和首版实现路径。目标是让 gateway
 进程重启、eBPF 程序重挂或主机短暂维护后，已有长生命周期会话尽量回到原 backend，
 同时不增加 TC eBPF 热路径开销。
 
 ## 结论
 
-可以做，但必须作为 gateway-only 的后台运行态能力实现，不能在 datapath 每包路径里做
-任何磁盘、SQLite 或同步 RPC 操作。
+可以做，且首版已经按 gateway-only 的后台运行态能力实现；不能在 datapath 每包路径里做
+任何磁盘、SQLite 或同步 RPC 操作这个约束保持不变。
 
 推荐方案是：后台周期性从 pinned `NATIVE_FLOWS` 生成本地二进制快照；启动时在 native
 datapath 挂载并完成 listener/target reconcile 后，从快照恢复仍未过期、仍匹配当前配置的
 flow pair。快照保存 `last_seen_age_ns` 或剩余 TTL，不保存本机 monotonic
 `last_seen_ns` 绝对值。
 
-该能力默认应关闭，先通过配置显式开启。开启后也要限制频率、批量、恢复数量和指标观测，
+该能力默认关闭，需要通过 `[gateway.flow_persistence]` 显式开启。开启后也要限制频率、批量、恢复数量和指标观测，
 避免 1M flow map 下用户态全量扫描成为新的 CPU/IO 压力源。
 
 ## 当前基础
@@ -25,6 +25,8 @@ flow pair。快照保存 `last_seen_age_ns` 或剩余 TTL，不保存本机 mono
 - `sweep_flows_and_refresh_loads` 已能清理过期 flow，并从 flow map 重算 `lc` active flow。
 - xSync wire 层已经使用 `last_seen_age_ns`，接收端按本机 monotonic clock 还原
   `last_seen_ns`。这个语义可以复用于本地持久化。
+- 首版本地持久化使用 `state_dir/native-flows.snapshot` 二进制文件，支持 checksum、
+  ABI/version 校验、启动恢复、关闭前 best-effort flush 和 Prometheus 指标。
 - 现有 xSync 每 2 秒做一次全量 `dump_flows` 补偿。1M map 下，这条全量扫描路径本身也
   需要压测和指标观测。
 
@@ -87,7 +89,7 @@ wall clock 大幅跳前时会更保守地丢弃 flow。
 - SQLite 文件膨胀和 vacuum 会影响运维；
 - 恢复路径需要大量随机读。
 
-推荐使用 state dir 下的单个二进制 snapshot 文件：
+首版使用 state dir 下的单个二进制 snapshot 文件：
 
 ```text
 /var/lib/edge-lb/native-flows.snapshot
@@ -174,28 +176,29 @@ wall clock 大幅跳前时会更保守地丢弃 flow。
 - restore 大批量写 map 会拉长启动时间；
 - LRU map 可能在恢复期间继续被新流写入，导致部分恢复 entry 被挤出。
 
-首版实现前必须补充 metrics：
+首版已经补充 metrics：
 
 | 指标 | 含义 |
 | --- | --- |
-| `edge_lb_flow_snapshot_records` | 最近一次写入的 canonical flow pair 数 |
-| `edge_lb_flow_snapshot_duration_seconds` | dump、编码、fsync 总耗时 |
-| `edge_lb_flow_snapshot_bytes` | 快照文件大小 |
-| `edge_lb_flow_snapshot_errors_total` | 快照失败次数 |
-| `edge_lb_flow_restore_records_total` | 启动恢复成功的 flow pair 数 |
-| `edge_lb_flow_restore_skipped_total{reason=...}` | 过期、配置不匹配、ABI 不匹配等跳过原因 |
-| `edge_lb_flow_restore_duration_seconds` | 恢复耗时 |
+| `edge_lb_gateway_native_flow_snapshot_records` | 最近一次写入的 canonical flow pair 数 |
+| `edge_lb_gateway_native_flow_snapshot_duration_seconds` | dump、编码、fsync 总耗时 |
+| `edge_lb_gateway_native_flow_snapshot_bytes` | 快照文件大小 |
+| `edge_lb_gateway_native_flow_snapshot_errors_total` | 快照失败次数 |
+| `edge_lb_gateway_native_flow_restore_records_total` | 启动恢复成功的 flow pair 数 |
+| `edge_lb_gateway_native_flow_restore_skipped_total{reason=...}` | 过期、配置不匹配、pair 不完整等跳过原因 |
+| `edge_lb_gateway_native_flow_restore_duration_seconds` | 恢复耗时 |
 
 ## 推荐落地步骤
 
-1. 增加 gateway 配置块 `gateway.flow_persistence`，默认关闭。
-2. 抽象 `FlowSnapshotRecord`，使用 endpoint 身份而不是旧 `target_id` 作为恢复依据。
-3. 实现 snapshot 文件编码、checksum、原子写入和读取。
-4. 增加启动 restore hook，放在 native datapath reconcile 之后。
-5. 增加后台 snapshot worker，先使用 30 秒 interval，并与 xSync 扫描避免重复。
-6. 补充 metrics 和日志。
-7. 写单元测试：时间恢复、过期跳过、target 重排 remap、配置删除跳过、pair 不完整跳过。
-8. 在测试环境做回归：SIP/UDP 长会话、进程重启、eBPF 重挂、主机重启、HA 切换后再重启。
+1. [已实现] 增加 gateway 配置块 `gateway.flow_persistence`，默认关闭。
+2. [已实现] 抽象 snapshot entry，使用 endpoint 身份而不是旧 `target_id` 作为恢复依据。
+3. [已实现] 实现 snapshot 文件编码、checksum、原子写入和读取。
+4. [已实现] 增加启动 restore hook，放在 native datapath reconcile 之后。
+5. [已实现] 增加后台 snapshot worker，首版使用 30 秒 interval。
+6. [已实现] 补充 metrics 和日志。
+7. [部分实现] 单元测试已覆盖时间恢复、过期跳过、pair 不完整跳过和编码 round-trip；
+   target 重排 remap、配置删除跳过需要继续补充。
+8. [待验证] 在测试环境做回归：SIP/UDP 长会话、进程重启、eBPF 重挂、主机重启、HA 切换后再重启。
 
 ## 当前不建议做的事
 

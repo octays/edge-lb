@@ -164,7 +164,90 @@ pub fn render_gateway(cfg: &Config) -> String {
         }
     }
 
+    render_flow_persistence_metrics(&mut out);
+
     out
+}
+
+fn render_flow_persistence_metrics(out: &mut String) {
+    let status = crate::provider::native::flow_persistence::status();
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_persistence_enabled",
+        &[],
+        bool_value(status.enabled),
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_snapshot_records",
+        &[],
+        status.snapshot_records as u64,
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_snapshot_bytes",
+        &[],
+        status.snapshot_bytes,
+        Some("gauge"),
+    );
+    metric_float_line(
+        out,
+        "edge_lb_gateway_native_flow_snapshot_duration_seconds",
+        &[],
+        status.snapshot_duration_ms as f64 / 1000.0,
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_snapshot_errors_total",
+        &[],
+        status.snapshot_errors_total,
+        Some("counter"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_records_total",
+        &[],
+        status.restore_records_total,
+        Some("counter"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_skipped_total",
+        &[("reason", "expired")],
+        status.restore_skipped_expired_total,
+        Some("counter"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_skipped_total",
+        &[("reason", "config")],
+        status.restore_skipped_config_total,
+        None,
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_skipped_total",
+        &[("reason", "incomplete")],
+        status.restore_skipped_incomplete_total,
+        None,
+    );
+    metric_float_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_duration_seconds",
+        &[],
+        status.restore_duration_ms as f64 / 1000.0,
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_flow_restore_errors_total",
+        &[],
+        status.restore_errors_total,
+        Some("counter"),
+    );
 }
 
 fn bool_value(value: bool) -> u64 {
