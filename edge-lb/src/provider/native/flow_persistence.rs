@@ -230,8 +230,11 @@ pub fn write_snapshot(cfg: &Config) -> Result<Option<SnapshotSummary>> {
     };
     let path = snapshot_path(&runtime_cfg);
     if pairs.is_empty() && path.exists() {
+        let existing_records = read_snapshot(&path)
+            .map(|snapshot| snapshot.entries.len() / 2)
+            .unwrap_or_default();
         let summary = SnapshotSummary {
-            records: 0,
+            records: existing_records,
             bytes: fs::metadata(&path)
                 .map(|meta| meta.len())
                 .unwrap_or_default(),
