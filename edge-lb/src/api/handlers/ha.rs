@@ -360,7 +360,7 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     let mut garp_announced = false;
     let mut vip_bound = false;
     if ha_cfg.enabled {
-        let changed = match crate::provider::native::ha::reconcile_vip(cfg) {
+        let changed = match crate::provider::native::ha::reconcile_vip_after_activation(cfg) {
             Ok(changed) => changed,
             Err(e) => return Reply::error(500, format!("applying HA takeover state: {e:#}")),
         };

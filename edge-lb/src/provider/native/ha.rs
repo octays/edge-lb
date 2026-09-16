@@ -77,6 +77,14 @@ pub fn state(cfg: &Config) -> Result<NativeHaState> {
 /// watcher does not emit gratuitous ARP on every pass. A newly promoted local
 /// gateway binds first and then announces the VIP on the underlay device.
 pub fn reconcile_vip(cfg: &Config) -> Result<bool> {
+    reconcile_vip_inner(cfg, false)
+}
+
+pub fn reconcile_vip_after_activation(cfg: &Config) -> Result<bool> {
+    reconcile_vip_inner(cfg, true)
+}
+
+fn reconcile_vip_inner(cfg: &Config, force_hook: bool) -> Result<bool> {
     let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
     if ha_cfg.enabled && matches!(ha_cfg.vip.provider, VipProvider::Hook) {
         let role = if local_gateway_is_active(cfg) {
@@ -84,7 +92,7 @@ pub fn reconcile_vip(cfg: &Config) -> Result<bool> {
         } else {
             "BACKUP"
         };
-        return apply_managed_hook_state_once(cfg, &ha_cfg, role, None);
+        return apply_managed_hook_state(cfg, &ha_cfg, role, None, force_hook);
     }
     let Some(vip_text) = ha_cfg.vip.private_vip.as_deref() else {
         return Ok(false);
@@ -121,7 +129,7 @@ pub fn release_local_vip(cfg: &Config) -> Result<bool> {
         return Ok(false);
     }
     if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
-        return apply_managed_hook_state_once(cfg, &ha_cfg, "BACKUP", None);
+        return apply_managed_hook_state(cfg, &ha_cfg, "BACKUP", None, true);
     }
     if !matches!(ha_cfg.vip.provider, VipProvider::L2) {
         return Ok(false);
@@ -252,7 +260,7 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
         } else {
             "BACKUP"
         };
-        apply_managed_hook_state_once(cfg, &ha_cfg, role, None)?;
+        apply_managed_hook_state(cfg, &ha_cfg, role, None, true)?;
     }
 
     Ok(SwitchActiveResult {
@@ -269,7 +277,7 @@ pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
             write_active_gateway(cfg, &cfg.node_name)?;
             let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
             if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
-                apply_managed_hook_state_once(cfg, &ha_cfg, "MASTER", non_empty(&event.vip))?;
+                apply_managed_hook_state(cfg, &ha_cfg, "MASTER", non_empty(&event.vip), true)?;
                 return Ok(());
             }
             if !event.vip.trim().is_empty() {
@@ -288,7 +296,7 @@ pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
         "BACKUP" | "STOP" => {
             let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
             if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
-                apply_managed_hook_state_once(cfg, &ha_cfg, "BACKUP", non_empty(&event.vip))?;
+                apply_managed_hook_state(cfg, &ha_cfg, "BACKUP", non_empty(&event.vip), true)?;
                 return Ok(());
             }
             if !event.vip.trim().is_empty() {
@@ -316,11 +324,12 @@ pub(crate) fn write_active_gateway(cfg: &Config, gateway: &str) -> Result<()> {
     cfg.write_active_gateway(gateway)
 }
 
-fn apply_managed_hook_state_once(
+fn apply_managed_hook_state(
     cfg: &Config,
     ha_cfg: &ha::GatewayHaRuntimeConfig,
     state: &'static str,
     vip_override: Option<String>,
+    force: bool,
 ) -> Result<bool> {
     let vip = vip_override
         .or_else(|| ha_cfg.vip.private_vip.clone())
@@ -331,7 +340,7 @@ fn apply_managed_hook_state_once(
     };
     let key = cfg.state_dir.clone();
     let lock = LAST_MANAGED_HOOK_STATE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    {
+    if !force {
         let last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if last.get(&key) == Some(&desired) {
             return Ok(false);
@@ -521,6 +530,71 @@ mod tests {
                 "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
                 "/usr/local/bin/edge-lb-demote:demote:BACKUP:192.0.2.200",
                 "/usr/local/bin/edge-lb-verify-vip:verify:BACKUP:192.0.2.200",
+            ]
+        );
+        assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn explicit_activation_forces_hook_and_verify_even_when_role_is_unchanged() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("hook-force-activation");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        cfg.write_active_gateway("gateway-a").unwrap();
+        let _ = take_state_dirty();
+
+        assert!(reconcile_vip(&cfg).unwrap());
+        assert!(!reconcile_vip(&cfg).unwrap());
+        assert!(reconcile_vip_after_activation(&cfg).unwrap());
+
+        let events: Vec<_> = test_hook_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.ends_with(":192.0.2.200"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
+            ]
+        );
+        assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn explicit_local_switch_forces_hook_and_verify_even_when_role_is_unchanged() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("hook-force-local-switch");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        cfg.write_active_gateway("gateway-a").unwrap();
+        let _ = take_state_dirty();
+
+        assert!(reconcile_vip(&cfg).unwrap());
+        assert!(!reconcile_vip(&cfg).unwrap());
+        let result = switch_active_gateway(&cfg, "gateway-a").unwrap();
+
+        assert_eq!(result.gateway, "gateway-a");
+        let events: Vec<_> = test_hook_events()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.ends_with(":192.0.2.200"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
+                "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
             ]
         );
         assert!(!take_state_dirty());
