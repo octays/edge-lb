@@ -233,6 +233,7 @@ pub fn run(cfg: &Config) -> Result<()> {
             DscpUpdate::Keep | DscpUpdate::Clear => None,
         };
     let mut flow_restore_done = false;
+    let mut redirect_worker = crate::linux::redirect::spawn(redirect_context(&cfg))?;
     // Reconcile startup templates after the same bounded subscription settle
     // window as node changes, not before the xDS server has started.
     let mut cached_dscp_ports = AgentState::load(Path::new(&*cfg.state_dir))?.dscp_ports;
@@ -265,11 +266,15 @@ pub fn run(cfg: &Config) -> Result<()> {
     let mut last_config_mtime = config_mtime(&cfg);
     let mut pending_node_change = Some(Instant::now());
     while !shutdown::requested() {
+        let context = redirect_context(&cfg);
+        if !redirect_worker.matches(&context) {
+            drop(redirect_worker);
+            redirect_worker = crate::linux::redirect::spawn(context)?;
+        }
         let mut needs_full = false;
         match native::ha::reconcile_vip(&cfg) {
             Ok(true) => {
-                needs_full = true;
-                tracing::info!("[gateway] HA VIP state changed; reconciling datapath");
+                tracing::info!("[gateway] HA VIP ownership changed; retaining datapath");
             }
             Ok(false) => {}
             Err(error) => tracing::warn!("[gateway] HA VIP reconcile skipped: {error:#}"),
@@ -438,6 +443,16 @@ fn config_mtime(cfg: &Config) -> Option<std::time::SystemTime> {
     fs::metadata(&cfg.path).and_then(|m| m.modified()).ok()
 }
 
+fn redirect_context(cfg: &Config) -> crate::linux::redirect::RedirectContext {
+    crate::linux::redirect::RedirectContext {
+        route_pin: crate::linux::native_dnat::redirect_route_pin(cfg),
+        marker_pin: dscp::config_pin(cfg),
+        ingress_device: cfg.network().underlay_dev.clone(),
+        return_device: cfg.network().vxlan_dev.clone(),
+        marker_priority: cfg.gateway_cfg().dscp_pref,
+    }
+}
+
 fn spawn_ui(cfg: &Config) {
     let cfg = cfg.clone();
     std::thread::Builder::new()
@@ -560,7 +575,8 @@ pub fn show(cfg: &Config) -> Result<()> {
     if let Err(error) = native::hydrate_proxy_config_from_api(&mut runtime_cfg) {
         println!("(unavailable: {error:#})");
     } else {
-        for lb in native::listeners_from_config(&runtime_cfg)? {
+        let listeners = native::listeners_from_config(&runtime_cfg)?;
+        for lb in &listeners {
             println!(
                 "{}: {} {:?}:{} -> {} target(s)",
                 lb.name,
@@ -569,6 +585,25 @@ pub fn show(cfg: &Config) -> Result<()> {
                 lb.key.vip_port,
                 lb.targets.len()
             );
+        }
+        section("redirect routing rules (not full fast-path admission)");
+        match crate::linux::redirect::observe_routing_policy() {
+            Ok(policy) => println!("{}", serde_json::to_string_pretty(&policy)?),
+            Err(error) => println!("(unavailable: {error:#})"),
+        }
+        section("redirect netfilter/XFRM policy (not full fast-path admission)");
+        match crate::linux::redirect::observe_kernel_policy() {
+            Ok(policy) => println!("{}", serde_json::to_string_pretty(&policy)?),
+            Err(error) => println!("(unavailable: {error:#})"),
+        }
+        section("redirect route observations (destination-only; not policy approval)");
+        let targets: Vec<_> = listeners
+            .iter()
+            .flat_map(|listener| listener.targets.iter().map(|target| target.address))
+            .collect();
+        match crate::linux::redirect::observe_target_routes(&targets) {
+            Ok(observations) => println!("{}", serde_json::to_string_pretty(&observations)?),
+            Err(error) => println!("(unavailable: {error:#})"),
         }
     }
     Ok(())

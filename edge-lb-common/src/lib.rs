@@ -1,5 +1,8 @@
 #![no_std]
 
+pub mod redirect;
+pub mod return_redirect;
+
 #[cfg(feature = "user")]
 extern crate std;
 
@@ -29,6 +32,8 @@ pub const NATIVE_CONSISTENT_HASH_BUCKETS: u32 = 1024;
 pub const NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY: u32 = 262_144;
 pub const NATIVE_LISTENER_ID_CAPACITY: u32 = 4096;
 pub const NATIVE_DNAT_INGRESS_PROGRAM: &str = "native_dnat_ingress";
+pub const NATIVE_LISTENERS_MAP: &str = "NATIVE_LISTENERS";
+pub const NATIVE_TARGETS_MAP: &str = "NATIVE_TARGETS";
 pub const NATIVE_DNAT_RETURN_PROGRAM: &str = "native_dnat_return";
 
 #[repr(C)]

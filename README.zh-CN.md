@@ -28,7 +28,9 @@ flowchart TD
     app --> reply --> vxlan --> revnat --> client
 ```
 
-只有经过网关标记的连接才走 VXLAN 回程；直连后端公网的流量完全不受影响。
+DNAT 使用目标组业务 IP，不隐式替换成 overlay；命中已订阅 DSCP 的连接经 VXLAN 回程。
+DSCP 不是认证，携带相同 codepoint 的直连流量也会被分类，应在网络边界隔离这些标记。
+升级与旧连接排空要求见 [业务地址修复说明](docs/dnat-service-address-fix.md)。
 
 ## 快速开始
 

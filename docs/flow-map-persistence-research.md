@@ -69,18 +69,13 @@ wall clock 大幅跳前时会更保守地丢弃 flow。
 持久化不能盲目恢复旧 `target_id`。`target_id` 是 listener 内的运行态 slot，目标组重排、
 删除或导入后可能变化。
 
-当前实现的恢复顺序是：
+当前只按 listener socket、协议、VIP、target 业务地址和端口匹配当前 endpoint，
+然后重映射当前 `listener_id` / `target_id`。地址不匹配则计入
+`skipped{reason="config"}`，不写入 eBPF。
 
-1. 优先按 listener socket、协议、VIP、target 地址和端口精确匹配当前 endpoint，并重映射
-   当前 `listener_id` / `target_id`。
-2. 如果精确匹配失败，但 snapshot 来自 HA peer 的 xSync 复制，旧 target 地址可能是对端
-   gateway 的 overlay 地址；此时仅在旧 `target_id` 仍落在当前 listener target 范围内，
-   且 target port 一致时，才按 `target_id` 做受限 fallback。
-3. fallback 恢复时必须把 `NativeFlowValue.target` 改写成本 gateway 当前 overlay target，
-   反向 flow key 也基于改写后的 target 生成。
-
-这个 fallback 依赖同一 target group 在 paired gateway 上保持相同目标顺序；如果目标组发生
-删除、重排或端口变化，不匹配的 flow 会被计入 `skipped{reason="config"}`，不会写入 eBPF。
+旧版本按 `target_id` 将对端 overlay 地址映射成本地 overlay 的 fallback 已删除。
+统一业务地址后两台 gateway 不需要这种转换，也不能仅凭相同下标把旧会话恢复到
+不同业务地址。详情见 [DNAT 业务地址修复](dnat-service-address-fix.md)。
 
 恢复时应使用目标端点身份重映射：
 

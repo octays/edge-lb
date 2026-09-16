@@ -22,6 +22,7 @@ IMAGE_OCI      ?= $(DIST_DIR)/edge-lb-image-$(IMAGE_TAG).oci.tar
 DOCKER         ?= docker run --rm -v $(PWD):/src -v edge-lb-cargo:/usr/local/cargo/registry -w /src $(BUILD_IMAGE)
 DOCKER_RUSTUP  ?= docker run --rm -v $(PWD):/src -v edge-lb-cargo:/usr/local/cargo/registry -v edge-lb-rustup:/usr/local/rustup -w /src $(BUILD_IMAGE)
 DOCKER_PRIVILEGED ?= docker run --rm --privileged -v $(PWD):/src -v edge-lb-cargo:/usr/local/cargo/registry -w /src $(BUILD_IMAGE)
+TEST_ARGS      ?=
 DEB_DOCKER     ?= docker run --rm -u $$(id -u):$$(id -g) -v $(PWD):/src -w /src debian:bookworm-slim
 UPX            ?= upx
 
@@ -68,8 +69,8 @@ check: build-image
 clippy: build-image
 	$(DOCKER_RUSTUP) bash -c "rustup component add clippy >/dev/null 2>&1; cargo clippy --workspace --exclude edge-lb-ebpf -- -D warnings"
 
-test: build-image
-	$(DOCKER_PRIVILEGED) cargo test -p edge-lb
+test: build-image ebpf
+	$(DOCKER_PRIVILEGED) cargo test -p edge-lb $(TEST_ARGS)
 
 ebpf:
 	cargo +$(EBPF_TOOLCHAIN) build -Z build-std=core --target $(EBPF_TARGET) -p edge-lb-ebpf --release

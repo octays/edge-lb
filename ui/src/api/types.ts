@@ -33,7 +33,6 @@ export interface TargetGroup {
   probe_port?: number | null
   probe_req?: string | null
   probe_resp?: string | null
-  probe_status?: number | null
   probe_skip_tls_verify?: boolean
   period_secs?: number | null
   retries?: number | null
@@ -210,7 +209,6 @@ export interface AutomationTargetGroupTemplate {
   probe_port?: number | null
   probe_req?: string | null
   probe_resp?: string | null
-  probe_status?: number | null
   probe_skip_tls_verify?: boolean
   period_secs?: number | null
   retries?: number | null

@@ -491,7 +491,7 @@ pub fn ensure_local_addrs(dev: &str, local_addrs: &[String]) -> Result<()> {
     })
 }
 
-fn run_netlink<F, T>(future: F) -> Result<T>
+pub(super) fn run_netlink<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send,
     T: Send,
@@ -499,6 +499,7 @@ where
     let run = move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .context("creating rtnetlink runtime")?
             .block_on(future)

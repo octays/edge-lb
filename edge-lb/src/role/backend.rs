@@ -1,8 +1,8 @@
 //! Backend node: VXLAN return tunnel, DSCP/ct-mark steering and policy
 //! routing, mirroring the verified procedure in docs/vxlan-dscp-verified.md.
 //!
-//! Only connections the gateway marked DSCP EF are sent back through the
-//! tunnel; direct traffic to the backend public IP is untouched.
+//! Original-direction connections with a subscribed DSCP select a VXLAN
+//! return path. DSCP is a trusted-network classifier, not authentication.
 
 use std::{
     collections::HashSet,
@@ -42,6 +42,7 @@ fn apply_with(
     managed: bool,
     existing: Option<return_path::ManagedReturnPath>,
 ) -> Result<Option<return_path::ManagedReturnPath>> {
+    cfg.validate_backend_return_paths()?;
     privilege::require_root()?;
     // xDS backends install the return path for every gateway snapshot.  The
     // gateway active/backup election is intentionally not consulted here.

@@ -25,7 +25,6 @@ HealthCheck {
   port: u16                    # 探测端口，不是转发端口
   request: string?             # tcp/udp 为探测请求，http/https 为路径
   response: string?            # 可选响应匹配
-  expected_status: u16?        # 仅 http/https，100..=599
   interval_secs: u32           # 默认 15
   retries: u32                 # 默认 3
   skip_tls_verify: bool        # 仅 https
@@ -35,7 +34,7 @@ HealthCheck {
 `monitor = false` 时，不创建探测任务，也不生成独立后端目标资源。探测结果只作为目标组运行时视图的一部分返回，例如 `targets[].health`，不能由客户端提交。目标组允许为空，以便自动配置先创建目标组、后随节点发现收敛目标成员。
 
 实现上健康检查字段仍与目标组平铺存储（`probe_type`、`probe_port`、
-`probe_req`、`probe_resp`、`probe_status`、`period_secs`、`retries` 和
+`probe_req`、`probe_resp`、`period_secs`、`retries` 和
 `probe_skip_tls_verify`）；上面的 `HealthCheck` 仅表示语义分组，不是额外
 的 JSON/TOML 嵌套对象。
 

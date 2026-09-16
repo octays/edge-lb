@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::File,
-    io::{self, BufWriter, Read, Write},
+    io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     path::PathBuf,
     process,
@@ -10,6 +10,9 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+mod raw_output;
+use raw_output::RawOutput;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -76,6 +79,13 @@ struct Stats {
 }
 
 fn main() {
+    if let Err(error) = run() {
+        eprintln!("ha-bench failed: {error}");
+        process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
     let cfg = match parse_args(env::args().skip(1).collect()) {
         Ok(cfg) => cfg,
         Err(error) => {
@@ -110,7 +120,7 @@ fn main() {
 
     let raw = match cfg.out.as_ref() {
         Some(path) => match File::create(path) {
-            Ok(file) => Some(Arc::new(Mutex::new(BufWriter::new(file)))),
+            Ok(file) => Some(Arc::new(Mutex::new(RawOutput::new(file)?))),
             Err(error) => {
                 eprintln!("creating {}: {error}", path.display());
                 process::exit(1);
@@ -118,15 +128,6 @@ fn main() {
         },
         None => None,
     };
-    if let Some(raw) = &raw {
-        let mut raw = raw.lock().expect("raw output mutex poisoned");
-        writeln!(
-            raw,
-            "timestamp_ms\tprotocol\tsource_port\tok\tlatency_us\tbackend\terror"
-        )
-        .expect("writing TSV header");
-    }
-
     let cfg = Arc::new(cfg);
     let deadline = Instant::now() + cfg.duration;
     let mut handles = Vec::new();
@@ -145,17 +146,26 @@ fn main() {
     }
 
     let mut stats: BTreeMap<Protocol, Stats> = BTreeMap::new();
+    let mut worker_failed = false;
     for handle in handles {
         match handle.join() {
             Ok(worker_stats) => merge_stats(&mut stats, worker_stats),
-            Err(_) => eprintln!("worker thread panicked"),
+            Err(_) => worker_failed = true,
         }
     }
     if let Some(raw) = &raw {
-        raw.lock().expect("raw output mutex poisoned").flush().ok();
+        raw.lock()
+            .map_err(|_| io::Error::other("raw output mutex poisoned"))?
+            .finish(stats.values().map(|stats| stats.total).sum())?;
+    }
+    if worker_failed {
+        return Err(io::Error::other(
+            "worker thread panicked; results incomplete",
+        ));
     }
 
     print_summary(&cfg, &stats);
+    Ok(())
 }
 
 fn run_worker(
@@ -164,7 +174,7 @@ fn run_worker(
     addr: SocketAddr,
     deadline: Instant,
     cfg: &Config,
-    raw: Option<Arc<Mutex<BufWriter<File>>>>,
+    raw: Option<Arc<Mutex<RawOutput<File>>>>,
 ) -> BTreeMap<Protocol, Stats> {
     let mut stats = BTreeMap::new();
     let mut tcp_stream = None;
@@ -437,23 +447,10 @@ fn record_sample(stats: &mut BTreeMap<Protocol, Stats>, sample: &Sample) {
     }
 }
 
-fn write_sample(raw: &Arc<Mutex<BufWriter<File>>>, sample: &Sample) {
-    let mut raw = raw.lock().expect("raw output mutex poisoned");
-    writeln!(
-        raw,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        sample.ts_ms,
-        protocol_name(sample.protocol),
-        sample
-            .source_port
-            .map(|port| port.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        u8::from(sample.ok),
-        sample.latency_us,
-        sample.backend,
-        sample.error
-    )
-    .ok();
+fn write_sample(raw: &Arc<Mutex<RawOutput<File>>>, sample: &Sample) {
+    raw.lock()
+        .expect("raw output mutex poisoned")
+        .record(sample);
 }
 
 fn merge_stats(target: &mut BTreeMap<Protocol, Stats>, source: BTreeMap<Protocol, Stats>) {
@@ -490,6 +487,10 @@ fn print_summary(cfg: &Config, stats: &BTreeMap<Protocol, Stats>) {
     );
     if let Some(path) = &cfg.out {
         println!("raw_results={}", path.display());
+        println!(
+            "raw_rows={}",
+            stats.values().map(|stats| stats.total).sum::<u64>()
+        );
     }
     println!();
 

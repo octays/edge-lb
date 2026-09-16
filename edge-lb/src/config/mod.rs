@@ -31,6 +31,7 @@ mod model;
 mod normalize;
 mod overlay;
 mod render;
+mod return_contract;
 mod validate;
 
 #[allow(unused_imports)]
@@ -89,23 +90,7 @@ impl FileConfig {
     }
 
     pub fn resolve_backend_target_address(&self, target: &BackendTarget) -> IpAddr {
-        let backends = self.backend_nodes_effective();
-        if let Some(address) = target.backend.as_ref().and_then(|name| {
-            backends
-                .iter()
-                .find(|backend| &backend.name == name)
-                .and_then(|backend| parse_overlay_host(&backend.overlay_ip).ok())
-        }) {
-            return address;
-        }
-        backends
-            .iter()
-            .find(|backend| backend.underlay_ip == target.address)
-            .and_then(|backend| parse_overlay_host(&backend.overlay_ip).ok())
-            .unwrap_or(target.address)
-    }
-
-    pub fn resolve_backend_probe_address(&self, target: &BackendTarget) -> IpAddr {
+        // Service identity is independent of the VXLAN return-path address.
         if !target.address.is_unspecified() {
             return target.address;
         }
@@ -120,6 +105,14 @@ impl FileConfig {
                     .map(|backend| backend.underlay_ip)
             })
             .unwrap_or(target.address)
+    }
+
+    pub fn resolve_backend_probe_address(&self, target: &BackendTarget) -> IpAddr {
+        self.resolve_backend_target_address(target)
+    }
+
+    pub(crate) fn validate_backend_return_paths(&self) -> Result<()> {
+        return_contract::validate(&self.backend_return_paths())
     }
 
     pub fn backend_return_paths(&self) -> Vec<GatewayReturnPath> {
@@ -490,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn native_backend_targets_resolve_to_overlay_addresses() {
+    fn native_backend_targets_preserve_service_addresses() {
         let mut file = FileConfig::default();
         file.backend_nodes.push(BackendNode {
             name: "backend-1".to_string(),
@@ -509,7 +502,7 @@ mod tests {
                 address: "192.0.2.20".parse().unwrap(),
                 weight: 1,
             }),
-            "10.255.255.2".parse::<IpAddr>().unwrap()
+            "192.0.2.20".parse::<IpAddr>().unwrap()
         );
         assert_eq!(
             cfg.resolve_backend_target_address(&BackendTarget {
@@ -517,8 +510,24 @@ mod tests {
                 address: "192.0.2.20".parse().unwrap(),
                 weight: 1,
             }),
-            "10.255.255.2".parse::<IpAddr>().unwrap()
+            "192.0.2.20".parse::<IpAddr>().unwrap()
         );
+        for (backend, address, expected) in [
+            (Some("backend-1"), "0.0.0.0", "192.0.2.20"),
+            (Some("backend-1"), "192.0.2.99", "192.0.2.99"),
+            (Some("backend-1"), "10.255.255.2", "10.255.255.2"),
+            (None, "192.0.2.99", "192.0.2.99"),
+            (Some("missing"), "0.0.0.0", "0.0.0.0"),
+        ] {
+            let target = BackendTarget {
+                backend: backend.map(str::to_owned),
+                address: address.parse().unwrap(),
+                weight: 1,
+            };
+            let expected: IpAddr = expected.parse().unwrap();
+            assert_eq!(cfg.resolve_backend_target_address(&target), expected);
+            assert_eq!(cfg.resolve_backend_probe_address(&target), expected);
+        }
     }
 
     #[test]
@@ -700,7 +709,6 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
                 probe_port: Some(8080),
                 probe_req: Some("/health".to_string()),
                 probe_resp: None,
-                probe_status: None,
                 probe_skip_tls_verify: false,
                 period_secs: Some(10),
                 retries: Some(2),

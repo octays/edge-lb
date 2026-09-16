@@ -640,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn bfd_promotion_marks_native_proxy_dirty_when_owner_changes() {
+    fn bfd_promotion_preserves_clean_datapath_when_owner_changes() {
         let (cfg, ha_cfg, dir) = test_gateway_config("bfd-promote");
         ha::save_for_state_dir(&dir, &ha_cfg).unwrap();
         fs::write(&cfg.ha.active_state_file, "gateway-a\n").unwrap();
@@ -654,7 +654,7 @@ mod tests {
         reconcile_election(&cfg, &ha_cfg, true);
 
         assert_eq!(cfg.active_gateway().unwrap().name, "gateway-b");
-        assert!(crate::provider::native::take_state_dirty());
+        assert!(!crate::provider::native::take_state_dirty());
         fs::remove_dir_all(dir).ok();
     }
 

@@ -515,18 +515,9 @@ fn remap_value(
     listeners: &ListenerRestoreIndex<'_>,
 ) -> Option<NativeFlowValue> {
     let listener = listeners.get(value.listener_id, forward_key, value)?;
-    let target_id = listener
-        .listener
-        .targets
-        .iter()
-        .position(|target| {
-            ipv4_to_u32(target.address) == value.target && target.port == value.target_port
-        })
-        .or_else(|| {
-            let target_id = usize::try_from(value.target_id).ok()?;
-            let target = listener.listener.targets.get(target_id)?;
-            (target.port == value.target_port).then_some(target_id)
-        })?;
+    let target_id = listener.listener.targets.iter().position(|target| {
+        ipv4_to_u32(target.address) == value.target && target.port == value.target_port
+    })?;
     let target = listener.listener.targets.get(target_id)?;
     Some(NativeFlowValue {
         listener_id: listener.listener_id,
@@ -976,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_remaps_cross_gateway_target_address_by_target_id() {
+    fn restore_rejects_old_overlay_address_instead_of_remapping_by_slot() {
         let (forward, mut value) = flow_entry(40000, 90);
         value.target_id = 1;
         value.target = ipv4_to_u32(Ipv4Addr::new(10, 255, 15, 3));
@@ -1017,10 +1008,7 @@ mod tests {
             by_socket: HashMap::new(),
         };
 
-        let remapped = remap_value(value, 10, forward, &listeners).unwrap();
-        assert_eq!(remapped.target_id, 1);
-        assert_eq!(remapped.target, ipv4_to_u32(Ipv4Addr::new(10, 255, 16, 3)));
-        assert_eq!(remapped.target_port, 5060);
+        assert!(remap_value(value, 10, forward, &listeners).is_none());
     }
 
     #[test]

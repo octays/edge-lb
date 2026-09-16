@@ -1317,24 +1317,14 @@ mod tests {
                 "requires privileged Linux container: {}",
                 io::Error::last_os_error()
             );
-            let ip = |args: &[&str]| {
-                let result = std::process::Command::new("ip")
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    result.status.success(),
-                    "ip {args:?}: {}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
-            };
-            ip(&["link", "add", "test-underlay", "type", "dummy"]);
-            ip(&["link", "set", "test-underlay", "up"]);
-            ip(&["addr", "add", "192.0.2.10/24", "dev", "test-underlay"]);
-            ip(&["link", "add", "test-return", "type", "dummy"]);
-            ip(&["link", "set", "test-return", "up"]);
-            ip(&["addr", "add", "10.44.0.2/24", "dev", "test-return"]);
-            ip(&["addr", "add", "10.45.0.2/24", "dev", "test-return"]);
+            use crate::linux::test_support as net;
+            net::dummy("test-underlay");
+            net::set_link(net::link("test-underlay").up());
+            net::address("test-underlay", "192.0.2.10/24");
+            net::dummy("test-return");
+            net::set_link(net::link("test-return").up());
+            net::address("test-return", "10.44.0.2/24");
+            net::address("test-return", "10.45.0.2/24");
             let vxlan = ifindex("test-return").unwrap();
             let underlay = ifindex("test-underlay").unwrap();
             let local = v4("192.0.2.10");
@@ -1467,20 +1457,7 @@ mod tests {
             let selector_rule =
                 ensure_rule_at_or_after_on_socket(fd, 200, want.mark, u32::MAX, want.table, &[])
                     .unwrap();
-            ip(&[
-                "rule",
-                "add",
-                "pref",
-                "200",
-                "from",
-                "198.51.100.0/24",
-                "fwmark",
-                "0x106e",
-                "table",
-                "1110",
-                "protocol",
-                "static",
-            ]);
+            net::rule(200, want.mark, want.table, Some("198.51.100.0/24"));
             let collision_before = dump_policy_rules_on_socket(fd).unwrap();
             assert!(delete_policy_rule_on_socket(fd, &selector_rule).is_err());
             assert_eq!(dump_policy_rules_on_socket(fd).unwrap(), collision_before);

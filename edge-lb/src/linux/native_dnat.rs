@@ -24,6 +24,8 @@ use edge_lb_common::{
     NativeConsistentHashBucketKey, NativeConsistentHashBucketValue, NativeListenerLookupKey,
     NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
     native_consistent_bucket_score,
+    redirect::{NATIVE_LOCAL_ADDRS_MAP, NATIVE_REDIRECT_STATS_MAP, NATIVE_TARGET_ROUTES_MAP},
+    return_redirect::{NATIVE_RETURN_LEASES_MAP, NATIVE_RETURN_STATS_MAP},
 };
 use sha2::{Digest, Sha256};
 
@@ -34,15 +36,15 @@ use crate::{
     },
 };
 
-const LISTENERS: &str = "NATIVE_LISTENERS";
-const TARGETS: &str = "NATIVE_TARGETS";
+const LISTENERS: &str = edge_lb_common::NATIVE_LISTENERS_MAP;
+const TARGETS: &str = edge_lb_common::NATIVE_TARGETS_MAP;
 const CHASH_BUCKETS: &str = "NATIVE_CHASH_BUCKETS";
 const FLOWS: &str = "NATIVE_FLOWS";
 const STATS: &str = "NATIVE_STATS";
 const FLOW_EVENTS: &str = "NATIVE_FLOW_EVENTS";
 const RR_COUNTERS: &str = "NATIVE_RR_COUNTERS";
 const ACTIVE_FLOWS: &str = "NATIVE_ACTIVE_FLOWS";
-const MAPS: [&str; 8] = [
+const MAPS: [&str; 13] = [
     LISTENERS,
     TARGETS,
     CHASH_BUCKETS,
@@ -51,6 +53,11 @@ const MAPS: [&str; 8] = [
     ACTIVE_FLOWS,
     STATS,
     FLOW_EVENTS,
+    NATIVE_TARGET_ROUTES_MAP,
+    NATIVE_REDIRECT_STATS_MAP,
+    NATIVE_LOCAL_ADDRS_MAP,
+    NATIVE_RETURN_LEASES_MAP,
+    NATIVE_RETURN_STATS_MAP,
 ];
 const INGRESS_PREF_OFFSET: u16 = 10;
 const RETURN_PREF_OFFSET: u16 = 11;
@@ -126,6 +133,10 @@ fn pin_path(cfg: &Config, name: &str) -> PathBuf {
     pin_dir(cfg).join(name)
 }
 
+pub fn redirect_route_pin(cfg: &Config) -> PathBuf {
+    pin_path(cfg, NATIVE_TARGET_ROUTES_MAP)
+}
+
 fn read_object() -> Result<Vec<u8>> {
     if let Some(bytes) = embedded::embedded_ebpf() {
         return Ok(bytes.to_vec());
@@ -135,13 +146,26 @@ fn read_object() -> Result<Vec<u8>> {
     ))
 }
 
-pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
+fn prepare_object() -> Result<Ebpf> {
+    let mut bpf = Ebpf::load(&read_object()?).context("loading native DNAT object")?;
+    for name in [NATIVE_DNAT_INGRESS_PROGRAM, NATIVE_DNAT_RETURN_PROGRAM] {
+        let program: &mut SchedClassifier = bpf
+            .program_mut(name)
+            .with_context(|| format!("missing {name}"))?
+            .try_into()?;
+        program
+            .load()
+            .with_context(|| format!("verifying {name}; existing attachment retained"))?;
+    }
+    Ok(bpf)
+}
+
+fn attach_prepared(cfg: &Config, mut bpf: Ebpf) -> Result<NativeDnatAttachment> {
     let listeners = listeners_from_config(cfg)?;
     if listeners.is_empty() {
         bail!("native DNAT requires at least one listener");
     }
     let n = cfg.network();
-    let mut bpf = Ebpf::load(&read_object()?).context("failed to load native DNAT eBPF object")?;
     let observed_targets = target_health_native(cfg).ok();
     let pin_dir = pin_dir(cfg);
     fs::create_dir_all(&pin_dir)
@@ -340,7 +364,6 @@ fn attach_program(bpf: &mut Ebpf, name: &str, dev: &str, priority: u16) -> Resul
         .ok_or_else(|| anyhow!("{name} program missing"))?
         .try_into()
         .with_context(|| format!("{name} is not a TC classifier"))?;
-    program.load().with_context(|| format!("loading {name}"))?;
     program
         .attach_with_options(
             dev,
@@ -367,6 +390,7 @@ pub fn apply(cfg: &Config) -> Result<()> {
         return cleanup(cfg);
     }
     let signature = format!("{listeners:?}");
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let mut current_signature = CURRENT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner());
     // Keep the running programs and flow map in place while only listener,
@@ -385,10 +409,13 @@ pub fn apply(cfg: &Config) -> Result<()> {
             return Ok(());
         }
     }
+    // Verify helpers and both programs before removing the running datapath.
+    // A missing FIB helper cannot be hidden by an empty lease map at runtime.
+    let prepared = prepare_object()?;
     if let Some(old) = current.take() {
         drop(old);
     }
-    *current = Some(attach_owned(cfg)?);
+    *current = Some(attach_prepared(cfg, prepared)?);
     *current_signature = Some(signature);
     Ok(())
 }
@@ -962,6 +989,7 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
     let listeners = listeners_from_config(cfg)?;
     let listener_ids = stable_listener_assignments(&listeners)?;
     let observed = target_health_native(cfg).ok();
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     sync_target_map(cfg, &listener_ids)?;
     sync_consistent_hash_bucket_map(cfg, &listener_ids)?;
     refresh_listener_weights(cfg, &listeners, observed.as_ref())?;
@@ -1012,6 +1040,7 @@ fn refresh_listener_weights(
 }
 
 pub fn cleanup(cfg: &Config) -> Result<()> {
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let mut current_signature = CURRENT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = current.take() {
@@ -1079,6 +1108,16 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
             total
         },
     ))
+}
+
+pub fn redirect_stats(cfg: &Config) -> Result<edge_lb_common::redirect::NativeRedirectStats> {
+    super::redirect::stats(&pin_path(cfg, NATIVE_REDIRECT_STATS_MAP))
+}
+
+pub fn return_redirect_stats(
+    cfg: &Config,
+) -> Result<edge_lb_common::return_redirect::ReturnRedirectStats> {
+    super::redirect::return_stats(&pin_path(cfg, NATIVE_RETURN_STATS_MAP))
 }
 
 #[cfg(test)]

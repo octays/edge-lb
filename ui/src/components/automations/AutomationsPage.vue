@@ -115,7 +115,6 @@ function defaultTemplate(): AutomationTemplateForm {
       probe_port: null,
       probe_req: null,
       probe_resp: null,
-      probe_status: null,
       probe_skip_tls_verify: false,
       period_secs: 15,
       retries: 3,
@@ -291,21 +290,13 @@ function normalizedTemplate(): AutomationTemplate {
   if (!['tcp', 'udp', 'http', 'https'].includes(next.target_group.probe_type || '')) {
     next.target_group.probe_req = null
     next.target_group.probe_resp = null
-    next.target_group.probe_status = null
     next.target_group.probe_skip_tls_verify = false
   } else if (!['http', 'https'].includes(next.target_group.probe_type || '')) {
     next.target_group.probe_req = next.target_group.probe_req?.trim() || null
     next.target_group.probe_resp = next.target_group.probe_resp?.trim() || null
-    next.target_group.probe_status = null
     next.target_group.probe_skip_tls_verify = false
   } else if (next.target_group.probe_type !== 'https') {
     next.target_group.probe_skip_tls_verify = false
-  }
-  if (next.target_group.probe_status != null) {
-    const status = Number(next.target_group.probe_status)
-    if (!Number.isInteger(status) || status < 100 || status > 599) {
-      throw new Error(t('expectedStatusRange'))
-    }
   }
   return next as AutomationTemplate
 }
@@ -596,10 +587,6 @@ function setNodeScope(value: string) {
                 <div v-if="['tcp', 'udp', 'http', 'https'].includes(form.target_group.probe_type || '')" class="space-y-1.5 lg:col-span-2">
                   <Label>{{ text('probeResponse') }}</Label>
                   <Input v-model="form.target_group.probe_resp" placeholder="{&quot;status&quot;:&quot;ok&quot;}" />
-                </div>
-                <div v-if="['http', 'https'].includes(form.target_group.probe_type || '')" class="space-y-1.5">
-                  <Label>{{ text('expectedStatus') }}</Label>
-                  <Input v-model.number="form.target_group.probe_status" type="number" min="100" max="599" placeholder="200" />
                 </div>
                 <div v-if="form.target_group.probe_type === 'https'" class="flex items-center gap-2 pt-7">
                   <Switch v-model="form.target_group.probe_skip_tls_verify" />

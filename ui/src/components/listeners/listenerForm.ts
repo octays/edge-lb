@@ -38,7 +38,6 @@ export type ListenerForm = {
   probe_port: number | null
   probe_req: string
   probe_resp: string
-  expected_status: number | null
   skip_tls_verify: boolean
   period_secs: number | null
   retries: number | null
@@ -58,7 +57,6 @@ const emptyListener: ListenerForm = {
   probe_port: null,
   probe_req: '',
   probe_resp: '',
-  expected_status: null,
   skip_tls_verify: false,
   period_secs: null,
   retries: null,
@@ -187,7 +185,6 @@ export function editListener(listener: ListenerConfig) {
     probe_port: group?.probe_port ?? null,
     probe_req: group?.probe_req ?? '',
     probe_resp: group?.probe_resp ?? '',
-    expected_status: group?.probe_status ?? null,
     skip_tls_verify: !!group?.probe_skip_tls_verify,
     period_secs: probeType === 'none' ? null : group?.period_secs ?? 15,
     retries: probeType === 'none' ? null : group?.retries ?? 3,

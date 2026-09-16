@@ -63,6 +63,10 @@ fn pin_path(cfg: &Config, name: &str) -> std::path::PathBuf {
     pin_dir(cfg).join(name)
 }
 
+pub fn config_pin(cfg: &Config) -> PathBuf {
+    pin_path(cfg, DSCP_CFG)
+}
+
 /// True when our bpf filter sits at the configured priority on `dev`.
 pub fn attached(cfg: &Config, dev: &str) -> bool {
     let out = tc::show_ingress(dev).unwrap_or_default();

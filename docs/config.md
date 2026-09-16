@@ -212,9 +212,9 @@ gateway 下发的是 backend 回程数据面所需的快照，不下发 gateway 
   和 route table，以及本 backend 在对应 overlay 中使用的 overlay IP。
 
 backend 不订阅 listener、target group、目标端口、健康探测或运行期服务投影。
-backend nft 回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或 backend
-port；业务监听端口由 gateway DSCP marker 负责限定。return-path 打标还必须匹配
-backend VXLAN ingress 设备，直连 backend 的同 DSCP 流量不会进入 edge-lb 回程路由。
+backend nft 在所有 IPv4 ingress 的 original 方向按 DSCP 识别连接，不匹配 L4
+protocol 或 backend port。业务监听端口由 gateway DSCP marker 负责限定。
+同 DSCP 直连流量也会被分类，部署方必须在网络边界隔离这些 codepoint。
 
 不下发：`[gateway.api]`、`[gateway.reconcile]`
 的本地管理细节，以及 active gateway 运行期状态、
@@ -322,7 +322,7 @@ nft_table = "edge_lb_return"
 mss = 1410
 ```
 
-backend 回程固定使用 nftables/conntrack 语义：入方向按 DSCP + 协议 + 后端端口
+backend 回程固定使用 nftables/conntrack 语义：所有 IPv4 ingress 的 original 方向按 DSCP
 设置 `ct mark`，reply 方向按 `ct mark` 设置 `fwmark`，再由 policy route 送入
 `edge-return`。该路径适用于 TCP、UDP 和 OpenSIPS 这类长期 UDP listener，
 不要求业务进程重启。当前实现通过 edge-lb 内置 nf_tables netlink 收敛，不依赖
@@ -332,7 +332,9 @@ backend 回程固定使用 nftables/conntrack 语义：入方向按 DSCP + 协�
 配置。单 gateway 和 HA xDS 都按 default-mode listener 的 DSCP 派生：
 `mark=0x1000|((gateway_slot+1)<<6)|dscp`、
 `table=1000+(gateway_slot+1)*64+dscp`。`gateway_slot` 按 gateway underlay IP
-排序得到，因此同 DSCP 的双 gateway 也会使用不同 mark/table。
+排序得到。各 gateway 必须使用不同的非零 DSCP（1..63）；slot 隔离并不能消除
+相同 DSCP 的分类歧义。UDP 不学习二元 tuple、不改写 overlay 源地址，完整语义见
+[业务地址与回程修复](dnat-service-address-fix.md)。
 
 运行日志使用 `tracing`。`log_level` 支持 `error`、`warn`、`info`、`debug`、
 `trace`，也支持 tracing env-filter 表达式，例如 `edge_lb=debug,tower=warn`。
