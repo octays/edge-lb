@@ -2,6 +2,9 @@
 
 ## 必读文档
 
+- `dnat-service-address-fix.md`：业务 IP 与隧道地址分离、统一 DSCP/conntrack 回程，
+  以及测试范围和协调升级要求。
+
 - `architecture.md`：当前架构真相源，说明 gateway/backend/native datapath 职责、xDS、
   数据面、持久化和 HA 边界。
 - `config.md`：当前配置真相源，说明 `/etc/edge-lb/config.toml`、角色配置、
@@ -10,8 +13,8 @@
 - `native-resource-model.md`：当前业务资源模型，说明监听配置、目标组和运行态投影边界。
 - `implementation-contracts.md`：已确认的监听、目标组、健康探测、DSCP 统计和生命周期
   语义。
-- `vxlan-dscp-verified.md`：当前线上验证方案，记录已验证节点、VXLAN/DSCP
-  参数、验证命令和排障检查。
+- `vxlan-dscp-verified.md`：当前 VXLAN/DSCP 回程语义、人工验证命令和排障检查；
+  本次修复的隔离测试不代表线上已部署。
 - `ha-pressure-test-report.zh-CN.md` / `ha-pressure-test-report.md`：HA 和并发压测报告。
 - `forwarding-performance-options.md`：gateway 转发性能候选方案评估，比较当前 TC DNAT、
   veth、TC redirect、XDP 和 AF_XDP 的收益边界与验证顺序。

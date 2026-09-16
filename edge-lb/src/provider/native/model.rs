@@ -178,11 +178,57 @@ fn ipv4_addr(value: IpAddr) -> Result<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use crate::config::{
-        BackendTarget, Config, DEFAULT_CONFIG_PATH, FileConfig, LbMode, Listener, Protocol,
-        TargetGroup,
+        BackendNode, BackendTarget, Config, DEFAULT_CONFIG_PATH, FileConfig, LbMode, Listener,
+        Protocol, TargetGroup,
     };
 
     use super::*;
+
+    #[test]
+    fn registered_backend_does_not_replace_service_address_with_overlay() {
+        let mut file = FileConfig::default();
+        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
+        file.backend_nodes.push(BackendNode {
+            name: "backend-1".into(),
+            public_ip: "198.51.100.20".parse().unwrap(),
+            underlay_ip: "192.0.2.20".parse().unwrap(),
+            overlay_ip: "10.255.255.2/24".into(),
+        });
+        file.target_groups.push(TargetGroup {
+            name: "service".into(),
+            targets: vec![BackendTarget {
+                backend: Some("backend-1".into()),
+                address: "192.0.2.20".parse().unwrap(),
+                weight: 1,
+            }],
+            ..TargetGroup::default()
+        });
+        file.listeners.push(Listener {
+            name: "service".into(),
+            port: 80,
+            target_port: 8080,
+            target_group: "service".into(),
+            protocols: vec![Protocol::Tcp, Protocol::Udp],
+            ..Listener::default()
+        });
+        let mut cfg = Config {
+            file,
+            path: DEFAULT_CONFIG_PATH.into(),
+        };
+        for select in [
+            crate::config::LbSelect::Rr,
+            crate::config::LbSelect::Hash,
+            crate::config::LbSelect::ConsistentHash,
+        ] {
+            cfg.file.listeners[0].select = select;
+            let listeners = listeners_from_config(&cfg).unwrap();
+            assert_eq!(listeners.len(), 2);
+            for listener in listeners {
+                assert_eq!(listener.targets[0].address, Ipv4Addr::new(192, 0, 2, 20));
+                assert_eq!(listener.targets[0].port, 8080);
+            }
+        }
+    }
 
     #[test]
     fn listener_conversion_preserves_default_dnat_shape() {

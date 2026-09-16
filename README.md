@@ -30,8 +30,11 @@ flowchart TD
     app --> reply --> vxlan --> revnat --> client
 ```
 
-Only connections marked by the gateway return through the VXLAN tunnel;
-traffic hitting the backend's public IP directly is untouched.
+DNAT uses the configured business IP, never an implicit overlay replacement.
+Replies to connections classified by a subscribed DSCP use the VXLAN return path.
+DSCP is not authentication: direct traffic carrying the same codepoint is also
+classified, so reserve these codepoints at the network boundary.
+See [address semantics and coordinated upgrade requirements](docs/dnat-service-address-fix.md).
 
 ## Quick start
 

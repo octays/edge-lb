@@ -19,8 +19,8 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
         validate_stun_server(index, server)?;
     }
     let _ = g;
-    if n.dscp >= 64 {
-        bail!("network.dscp must be in 0..63, got {}", n.dscp);
+    if !(1..=63).contains(&n.dscp) {
+        bail!("network.dscp must be in 1..63, got {}", n.dscp);
     }
     if n.vni == 0 || n.vni > 0xff_ffff {
         bail!("network.vni must be in 1..16777215, got {}", n.vni);
@@ -56,6 +56,10 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
         );
     }
     if matches!(file.node_role, NodeRole::Backend) {
+        // Bootstrap gateway inventory is not a received return-path contract.
+        if !file.backend_return_paths.is_empty() {
+            file.validate_backend_return_paths()?;
+        }
         let xds_gateways = effective_backend_xds_gateways(file);
         if xds_gateways.len() > 2 {
             bail!(

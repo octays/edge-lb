@@ -17,17 +17,24 @@
   设备/VNI/端口/MTU，以及每个 gateway 的 DSCP、fwmark 和 route table。
   不能下发监听、目标组、目标端口、健康探测、backend inventory、公网 IP 或任何
   gateway 业务配置字段；也不能下发 active gateway 状态或 UDP service port。
-- backend nft 基础回程打标只按 gateway DSCP 识别连接，不匹配 L4 protocol 或
-  backend port。业务端口边界由 gateway DSCP marker 负责；backend 不再依赖
-  `return_ports`、监听端口裁剪或 active gateway。
-- UDP 服务若绑定 `0.0.0.0`，Linux 可能用 underlay 源地址发回包，导致 conntrack
-  无法把它识别为原 VXLAN ingress 流的 reply。backend 只能从已进入 backend VXLAN
-  设备且命中 DSCP 的 UDP 包中学习 `client_ip . client_port` 动态 tuple，并在
-  `output` 对命中该 tuple 的 UDP 回包修正 source overlay 和 fwmark。动态 tuple
-  有短 timeout；规则不得匹配或写入任何 backend service port。
-- backend nft 回程打标必须同时匹配配置中的 backend VXLAN ingress 设备名
-  （默认 `edge-return`）和 DSCP。直连 backend 的业务流量即使带相同 DSCP，也不能被
-  edge-lb return-path 规则设置 `ct mark`。
+- DNAT 必须使用目标组显式配置的业务地址；仅按 backend 名称引用且地址未指定时，
+  才解析为该 backend 的 underlay IP。健康探测、健康状态身份和 native target 使用同一
+  解析语义，不得自动用 backend overlay 替换业务地址。
+- backend 在所有 IPv4 ingress 的 conntrack original 方向按已订阅 DSCP 设置 ct mark，
+  不依赖 VXLAN ingress 设备、L4 协议、业务端口或 active gateway。reply 方向只恢复
+  当前有效 contract 的 routing fwmark，经 VXLAN 返回 gateway；不改写业务源 IP。
+- DSCP 是受信网络内的回程分类标记，不是身份认证。直连流量若携带相同 DSCP，也会
+  被分类；部署方必须隔离这些 codepoint，不能再声称“同 DSCP 直连一定不被接管”。
+  contract DSCP 必须为 1..63，多个 gateway 的 DSCP、非零 mark 和路由表不能冲突。
+  非法或歧义 contract 必须在修改内核状态前拒绝，不以规则顺序决定回程。
+- 快照恢复必须匹配业务地址和端口，不按目标下标把旧 overlay 会话改写到另一地址。
+- 删除 UDP 的 client_ip/client_port 动态 set、30 秒学习和 overlay 源修正规则，
+  TCP/UDP 统一使用 conntrack 完整连接元组与 mark。规则重装不主动清空 conntrack。
+  同一完整 UDP 五元组若先后从两个 gateway 进入，最近的已分类请求更新连接 mark；
+  无法区分同一五元组内不同应用事务，不能宣称按请求级别保证回包归属。
+- UDP 服务必须以收到请求的业务地址作为回复源。普通单 underlay 主机的 wildcard
+  socket 纳入内核测试；多地址主机应绑定业务 IP 或使用 IP_PKTINFO 保持源地址。
+  不再用跨业务地址的二元 tuple 猜测修正源地址；已有 overlay 连接需排空后升级。
 - HA backend 同时订阅多个 gateway 时，必须等所有配置中的 gateway snapshot 都收到
   后再 apply。部分快照只能 ACK 等待或保持现有数据面，不能把已安装的多 gateway
   return path 收窄成单 gateway。

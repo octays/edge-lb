@@ -886,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn monitored_backend_target_probes_underlay_but_updates_overlay_health() {
+    fn monitored_backend_target_uses_same_service_address_for_probe_and_health() {
         let mut cfg = cfg_with_group(true, Some("tcp"));
         cfg.file.backend_nodes.push(BackendNode {
             name: "backend-1".to_string(),
@@ -907,7 +907,7 @@ mod tests {
             targets[0].names,
             vec![target_health_identity(
                 "web",
-                "10.255.255.2".parse().unwrap(),
+                "192.0.2.20".parse().unwrap(),
                 "tcp",
                 8080
             )]

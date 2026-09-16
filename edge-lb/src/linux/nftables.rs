@@ -1,18 +1,16 @@
 //! Minimal nf_tables netlink encoder for edge-lb owned tables.
-#![allow(dead_code)]
 
-use std::{ffi::CString, io, mem::size_of, os::fd::RawFd};
+use std::{ffi::CString, mem::size_of};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+mod transport;
 
 use crate::config::{Config, GatewayReturnPath};
 
 const NLM_F_REQUEST: u16 = libc::NLM_F_REQUEST as u16;
 const NLM_F_ACK: u16 = libc::NLM_F_ACK as u16;
 const NLM_F_CREATE: u16 = libc::NLM_F_CREATE as u16;
-
-const NLMSG_ERROR: u16 = libc::NLMSG_ERROR as u16;
-const NLMSG_DONE: u16 = libc::NLMSG_DONE as u16;
 
 const NFNL_SUBSYS_NFTABLES: u16 = libc::NFNL_SUBSYS_NFTABLES as u16;
 const NFNETLINK_V0: u8 = libc::NFNETLINK_V0 as u8;
@@ -36,7 +34,6 @@ const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = libc::NFT_PAYLOAD_TRANSPORT_HEADER as 
 const NFT_CMP_EQ: u32 = libc::NFT_CMP_EQ as u32;
 const NFT_BITWISE_BOOL: u32 = 0;
 const NFT_META_MARK: u32 = libc::NFT_META_MARK as u32;
-const NFT_META_IIFNAME: u32 = libc::NFT_META_IIFNAME as u32;
 const NFT_META_OIFNAME: u32 = libc::NFT_META_OIFNAME as u32;
 const NFT_META_NFPROTO: u32 = libc::NFT_META_NFPROTO as u32;
 const NFT_META_L4PROTO: u32 = libc::NFT_META_L4PROTO as u32;
@@ -104,6 +101,7 @@ struct NfGenMsg {
 }
 
 pub fn apply_return_path(cfg: &Config) -> Result<()> {
+    cfg.validate_backend_return_paths()?;
     let mut msg = Message::new();
     let mut seq = 0;
     msg.begin_batch(&mut seq);
@@ -285,7 +283,7 @@ fn rule_body_in_table(table: &str, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> 
     body
 }
 
-fn forward_mark_exprs(cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
+fn forward_mark_exprs(_cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
     let dscp = path.dscp;
     // Out-of-range dscp used to be truncated to a DSCP-0 match here, which
     // silently matched nothing and dropped the connection into the main
@@ -294,8 +292,8 @@ fn forward_mark_exprs(cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<
         .with_context(|| format!("gateway return path dscp {dscp} out of range 0..=63"))?;
     let mark = path.mark;
     Ok(vec![
-        meta_load(NFT_META_IIFNAME),
-        cmp_bytes(&ifname_bytes(&cfg.network().vxlan_dev)),
+        ct_load(NFT_CT_DIRECTION),
+        cmp_u8(0),
         meta_load(NFT_META_NFPROTO),
         cmp_u8(NFPROTO_IPV4),
         payload_load(NFT_PAYLOAD_NETWORK_HEADER, 1, 1),
@@ -490,7 +488,7 @@ impl Message {
     }
 
     fn send(self) -> Result<()> {
-        send_netfilter(&self.buf)
+        transport::transact(&self.buf)
     }
 }
 
@@ -573,104 +571,6 @@ fn pad(buf: &mut Vec<u8>) {
 
 fn bytes_of<T>(value: &T) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()).to_vec() }
-}
-
-fn send_netfilter(buf: &[u8]) -> Result<()> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_NETFILTER,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error()).context("opening netfilter netlink socket");
-    }
-    let result = send_recv(fd, buf);
-    unsafe {
-        libc::close(fd);
-    }
-    result
-}
-
-fn send_recv(fd: RawFd, buf: &[u8]) -> Result<()> {
-    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    let bind_ret = unsafe {
-        libc::bind(
-            fd,
-            (&addr as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if bind_ret < 0 {
-        return Err(io::Error::last_os_error()).context("binding netfilter netlink socket");
-    }
-
-    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    let sent = unsafe {
-        libc::sendto(
-            fd,
-            buf.as_ptr().cast(),
-            buf.len(),
-            0,
-            (&kernel as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if sent < 0 || sent as usize != buf.len() {
-        return Err(io::Error::last_os_error()).context("sending nf_tables netlink request");
-    }
-
-    loop {
-        let mut resp = [0_u8; 8192];
-        let len = unsafe { libc::recv(fd, resp.as_mut_ptr().cast(), resp.len(), 0) };
-        if len < 0 {
-            return Err(io::Error::last_os_error()).context("reading nf_tables netlink ack");
-        }
-        if len == 0 {
-            bail!("empty nf_tables netlink response");
-        }
-        if parse_ack_messages(&resp[..len as usize])? {
-            return Ok(());
-        }
-    }
-}
-
-fn parse_ack_messages(buf: &[u8]) -> Result<bool> {
-    let mut offset = 0;
-    let mut saw_terminal = false;
-    while offset + size_of::<libc::nlmsghdr>() <= buf.len() {
-        let hdr = unsafe { &*(buf[offset..].as_ptr().cast::<libc::nlmsghdr>()) };
-        if hdr.nlmsg_len < size_of::<libc::nlmsghdr>() as u32 {
-            bail!("short nf_tables netlink message");
-        }
-        let end = offset + align(hdr.nlmsg_len as usize);
-        if end > buf.len() {
-            bail!("truncated nf_tables netlink message");
-        }
-        let payload_start = offset + size_of::<libc::nlmsghdr>();
-        let payload_end = offset + hdr.nlmsg_len as usize;
-        match hdr.nlmsg_type {
-            NLMSG_ERROR => {
-                if payload_end < payload_start + size_of::<libc::nlmsgerr>() {
-                    bail!("short nf_tables netlink ack");
-                }
-                let err =
-                    unsafe { &*(buf[payload_start..].as_ptr().cast::<libc::nlmsgerr>()) }.error;
-                if err != 0 {
-                    return Err(io::Error::from_raw_os_error(-err))
-                        .context("nf_tables netlink request failed");
-                }
-                saw_terminal = true;
-            }
-            NLMSG_DONE => saw_terminal = true,
-            _ => {}
-        }
-        offset = end;
-    }
-    Ok(saw_terminal)
 }
 
 fn align(len: usize) -> usize {
