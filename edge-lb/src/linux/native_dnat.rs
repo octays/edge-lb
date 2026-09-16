@@ -1105,6 +1105,7 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
                 .chash_bucket_unusable
                 .saturating_add(value.chash_bucket_unusable);
             total.chash_fallback = total.chash_fallback.saturating_add(value.chash_fallback);
+            total.flow_event_lost = total.flow_event_lost.saturating_add(value.flow_event_lost);
             total
         },
     ))

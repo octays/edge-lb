@@ -50,6 +50,20 @@ pub fn render_gateway(cfg: &Config) -> String {
         bool_value(crate::linux::native_dnat::attached(cfg)),
         Some("gauge"),
     );
+    metric_line(
+        &mut out,
+        "edge_lb_gateway_native_flow_map_capacity",
+        &[],
+        edge_lb_common::NATIVE_FLOW_MAP_CAPACITY as u64,
+        Some("gauge"),
+    );
+    metric_line(
+        &mut out,
+        "edge_lb_gateway_native_flow_pair_capacity",
+        &[],
+        edge_lb_common::NATIVE_FLOW_PAIR_CAPACITY as u64,
+        Some("gauge"),
+    );
 
     if let Ok(stats) = crate::linux::dscp::stats(cfg) {
         metric_line(
@@ -137,6 +151,13 @@ pub fn render_gateway(cfg: &Config) -> String {
             "edge_lb_gateway_native_consistent_hash_fallback_total",
             &[],
             stats.chash_fallback,
+            Some("counter"),
+        );
+        metric_line(
+            &mut out,
+            "edge_lb_gateway_native_flow_event_lost_total",
+            &[],
+            stats.flow_event_lost,
             Some("counter"),
         );
     }

@@ -19,8 +19,7 @@ flow pair。快照保存 `last_seen_age_ns` 或剩余 TTL，不保存本机 mono
 
 ## 当前基础
 
-- `NATIVE_FLOWS` 是 pinned eBPF LRU map，当前容量为 `1048576` entry。
-- 每条逻辑连接通常写正向和反向两条 entry，理想容量约 `524288` 对双向连接。
+- `NATIVE_FLOWS` 是 pinned eBPF LRU map，当前容量为 `1048576` entry；每条逻辑连接通常写正向和反向两条 entry，因此估算容量约 `524288` 个 canonical flow pair。
 - 用户态已有 `dump_flows`、`upsert_flows` 和 `delete_flows`，可以读取和写回 pinned map。
 - `sweep_flows_and_refresh_loads` 已能清理过期 flow，并从 flow map 重算 `lc` active flow。
 - xSync wire 层已经使用 `last_seen_age_ns`，接收端按本机 monotonic clock 还原

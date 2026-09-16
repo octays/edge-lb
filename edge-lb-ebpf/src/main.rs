@@ -24,12 +24,12 @@ use aya_ebpf::{
 use aya_ebpf_cty::c_long;
 use edge_lb_common::{
     DEFAULT_DSCP, DSCP_PORT_MAP_CAPACITY, MAX_TARGETS_PER_LISTENER,
-    NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_LISTENER_ID_CAPACITY,
-    NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST,
-    NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR, NativeConsistentHashBucketKey,
-    NativeConsistentHashBucketValue, NativeFlowEvent, NativeFlowKey, NativeFlowValue,
-    NativeListenerLookupKey, NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey,
-    NativeTargetValue, Stats, native_consistent_flow_bucket,
+    NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_FLOW_MAP_CAPACITY,
+    NATIVE_LISTENER_ID_CAPACITY, NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH,
+    NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
+    NativeConsistentHashBucketKey, NativeConsistentHashBucketValue, NativeFlowEvent, NativeFlowKey,
+    NativeFlowValue, NativeListenerLookupKey, NativeListenerLookupValue, NativeTargetKey,
+    NativeTargetLoadKey, NativeTargetValue, Stats, native_consistent_flow_bucket,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -69,7 +69,7 @@ static NATIVE_ACTIVE_FLOWS: HashMap<NativeTargetLoadKey, u32> = HashMap::with_ma
 
 #[map]
 static NATIVE_FLOWS: LruHashMap<NativeFlowKey, NativeFlowValue> =
-    LruHashMap::with_max_entries(1048576, 0);
+    LruHashMap::with_max_entries(NATIVE_FLOW_MAP_CAPACITY, 0);
 
 #[map]
 static NATIVE_FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
@@ -245,15 +245,20 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
 
 #[inline(always)]
 fn emit_flow_event(key: NativeFlowKey, value: NativeFlowValue, op: u8) {
-    let _ = NATIVE_FLOW_EVENTS.output(
-        &NativeFlowEvent {
-            key,
-            value,
-            op,
-            _pad: [0; 7],
-        },
-        0,
-    );
+    if NATIVE_FLOW_EVENTS
+        .output(
+            &NativeFlowEvent {
+                key,
+                value,
+                op,
+                _pad: [0; 7],
+            },
+            0,
+        )
+        .is_err()
+    {
+        native_bump(|stats| stats.flow_event_lost += 1);
+    }
 }
 
 #[classifier]

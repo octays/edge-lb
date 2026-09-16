@@ -85,6 +85,9 @@ rate(edge_lb_process_cpu_seconds_total[1m]) / edge_lb_host_cpu_cores
 | `edge_lb_gateway_native_return_miss_total` | counter | reverse NAT 未找到 flow 的次数。 |
 | `edge_lb_gateway_native_rewritten_total` | counter | native datapath 完成改写的包总数。 |
 | `edge_lb_gateway_native_checksum_error_total` | counter | native NAT 地址/端口 store、checksum 更新或 UDP zero-checksum 恢复失败的包数；`patch` 中这些改写失败统一丢弃，每包计一次。 |
+| `edge_lb_gateway_native_flow_map_capacity` | gauge | `NATIVE_FLOWS` eBPF LRU map 的 entry 容量。每条连接通常占用正向和反向两条 entry。 |
+| `edge_lb_gateway_native_flow_pair_capacity` | gauge | 按双向 entry 估算的最大 flow pair 容量；当前 `1048576 / 2 = 524288`。 |
+| `edge_lb_gateway_native_flow_event_lost_total` | counter | native flow 新建/删除事件写入 ringbuf 失败次数；该指标增长表示 xSync 可能需要依赖低频差量补偿。 |
 | `edge_lb_gateway_native_consistent_hash_bucket_hit_total` | counter | `consistent_hash` 新流命中 bucket table 的次数。 |
 | `edge_lb_gateway_native_consistent_hash_bucket_miss_total` | counter | `consistent_hash` 新流未找到 bucket 的次数，通常表示 bucket 表未写入或不完整。 |
 | `edge_lb_gateway_native_consistent_hash_bucket_unusable_total` | counter | bucket 指向的 target 当前不可用或越界的次数。 |
