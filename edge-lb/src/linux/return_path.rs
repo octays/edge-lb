@@ -37,10 +37,14 @@ pub fn apply_managed_reusing(
     existing: Option<ManagedReturnPath>,
 ) -> Result<ManagedReturnPath> {
     let signature = signature(cfg);
+    let current = existing.as_ref().map(|managed| &managed.signature);
     if signature.paths.is_empty() {
-        nft::delete_table(cfg);
+        if current != Some(&signature) || nft::table_exists(cfg) {
+            nft::delete_table(cfg);
+        } else {
+            tracing::debug!("[backend] return-path nft empty and absent; skipping table delete");
+        }
     } else {
-        let current = existing.as_ref().map(|managed| &managed.signature);
         if current != Some(&signature) || !nft::table_exists(cfg) {
             nft::apply(cfg)?;
         } else {
