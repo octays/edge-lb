@@ -332,7 +332,7 @@ pub(in crate::api) fn peer_status(cfg: &Config) -> Reply {
     )
 }
 
-/// Apply a coordinated manual promotion requested by the paired gateway.
+/// Apply the local HA role for a coordinated manual failover requested by the peer.
 pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     if let Some(reply) = require_gateway(cfg) {
         return reply;
