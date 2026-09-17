@@ -353,13 +353,6 @@ fn render_redirect_admission_metrics(
         status.updated_unix_seconds,
         Some("gauge"),
     );
-    metric_line(
-        out,
-        "edge_lb_gateway_native_redirect_map_digest",
-        &[],
-        status.map_digest,
-        Some("gauge"),
-    );
 }
 
 fn render_return_redirect_metrics(
@@ -776,7 +769,6 @@ mod tests {
             crate::linux::redirect::RedirectAdmissionStatus {
                 state: "blocked",
                 reason: "rp_filter",
-                map_digest: 456,
                 updated_unix_seconds: 123,
             },
         );
@@ -784,7 +776,6 @@ mod tests {
             "edge_lb_gateway_native_redirect_admission_status{state=\"blocked\",reason=\"rp_filter\"} 1\n"
         ));
         assert!(out.contains("edge_lb_gateway_native_redirect_admission_updated_seconds 123\n"));
-        assert!(out.contains("edge_lb_gateway_native_redirect_map_digest 456\n"));
     }
 
     #[test]
