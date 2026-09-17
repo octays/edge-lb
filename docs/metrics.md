@@ -149,11 +149,18 @@ rate(edge_lb_gateway_native_return_redirect_mutation_error_total[1m])
 | 指标 | 类型 | 说明 |
 | --- | --- | --- |
 | `edge_lb_gateway_native_redirect_stats_available` | gauge | 本次成功读取 map 为 1，否则为 0；不表示准入或发送成功。 |
+| `edge_lb_gateway_native_redirect_admission_status{state,reason}` | gauge | 最近一次自动准入/发布状态，固定输出一条值为 1 的样本；不是每包命中率。 |
+| `edge_lb_gateway_native_redirect_admission_updated_seconds` | gauge | 最近一次自动准入/发布状态更新的 Unix 秒。 |
 | `edge_lb_gateway_native_redirect_submitted_total` | counter | helper 返回 redirect 动作的次数，不等于设备发送成功或端到端成功。 |
 | `edge_lb_gateway_native_redirect_fallback_total{reason}` | counter | 未修改 TTL/L2 前回退的次数，原因见下表。 |
 | `edge_lb_gateway_native_redirect_mutation_error_total` | counter | 开始修改 TTL/L2 后的 helper 错误，此时丢弃而非回退，避免半修改报文进入协议栈。 |
 
-`reason` 使用固定低基数集合，不以 IP、MAC、target 或 listener 作为标签：
+`admission_status` 的 `state` 当前为 `unknown`、`published` 或 `blocked`。`reason` 使用固定低基数集合，
+例如 `none`、`startup`、`rp_filter`、`forwarding`、`routing_policy`、`kernel_policy`、
+`tc`、`lease`、`neighbor`、`route`、`cache`、`other`。它帮助区分 `route_miss` 是尚未收敛、
+准入被策略拒绝还是缓存被撤销；不能用它替代 redirect submitted/fallback 的 per-packet 统计。
+
+`fallback_total{reason}` 的 `reason` 也使用固定低基数集合，不以 IP、MAC、target 或 listener 作为标签：
 
 | reason | 含义 |
 | --- | --- |

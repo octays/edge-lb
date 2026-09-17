@@ -18,6 +18,7 @@ mod return_admission;
 mod return_maps;
 mod return_planner;
 mod stats;
+mod status;
 mod worker;
 
 pub use kernel_policy::observe_kernel_policy;
@@ -28,6 +29,7 @@ pub use model::TargetRouteObservation;
 pub use netlink::{observe_routing_policy, observe_target_routes};
 pub use reconcile::RedirectContext;
 pub use stats::{return_stats, stats};
+pub use status::{RedirectAdmissionStatus, current as admission_status};
 pub use worker::spawn;
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ use super::{
     events::RouteEvents,
     maps::invalidate_routes,
     reconcile::{self, RedirectContext},
+    status,
 };
 
 pub struct InvalidationWorker {
@@ -73,19 +74,22 @@ fn run(context: &RedirectContext, stop: &AtomicBool) {
             }
             if last_refresh.elapsed() >= Duration::from_millis(500) {
                 last_refresh = Instant::now();
-                reconcile::refresh(context, events.as_ref().expect("monitor initialized"))?;
-                return Ok(true);
+                return reconcile::refresh(context, events.as_ref().expect("monitor initialized"));
             }
             Ok(false)
         })();
         match result {
             Ok(refreshed) => {
+                if refreshed {
+                    status::record_published();
+                }
                 if refreshed && previous_error.take().is_some() {
                     tracing::info!("[redirect] route invalidation monitor recovered");
                 }
             }
             Err(error) => {
                 events = None;
+                status::record_blocked(&format!("{error:#}"));
                 let invalidation = invalidate_routes(pin);
                 let error = match invalidation {
                     Ok(_) => format!("{error:#}; redirect cache invalidated"),

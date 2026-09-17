@@ -166,6 +166,7 @@ pub fn render_gateway(cfg: &Config) -> String {
         &mut out,
         crate::linux::native_dnat::redirect_stats(cfg).ok(),
     );
+    render_redirect_admission_metrics(&mut out, crate::linux::redirect::admission_status());
     render_return_redirect_metrics(
         &mut out,
         crate::linux::native_dnat::return_redirect_stats(cfg).ok(),
@@ -332,6 +333,26 @@ fn render_redirect_metrics(
             (index == 0).then_some("counter"),
         );
     }
+}
+
+fn render_redirect_admission_metrics(
+    out: &mut String,
+    status: crate::linux::redirect::RedirectAdmissionStatus,
+) {
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_admission_status",
+        &[("state", status.state), ("reason", status.reason)],
+        1,
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_admission_updated_seconds",
+        &[],
+        status.updated_unix_seconds,
+        Some("gauge"),
+    );
 }
 
 fn render_return_redirect_metrics(
@@ -738,6 +759,23 @@ mod tests {
                 .count(),
             7
         );
+    }
+
+    #[test]
+    fn redirect_admission_metric_has_bounded_status_labels() {
+        let mut out = String::new();
+        render_redirect_admission_metrics(
+            &mut out,
+            crate::linux::redirect::RedirectAdmissionStatus {
+                state: "blocked",
+                reason: "rp_filter",
+                updated_unix_seconds: 123,
+            },
+        );
+        assert!(out.contains(
+            "edge_lb_gateway_native_redirect_admission_status{state=\"blocked\",reason=\"rp_filter\"} 1\n"
+        ));
+        assert!(out.contains("edge_lb_gateway_native_redirect_admission_updated_seconds 123\n"));
     }
 
     #[test]

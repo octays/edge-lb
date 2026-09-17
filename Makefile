@@ -70,7 +70,7 @@ clippy: build-image
 	$(DOCKER_RUSTUP) bash -c "rustup component add clippy >/dev/null 2>&1; cargo clippy --workspace --exclude edge-lb-ebpf -- -D warnings"
 
 test: build-image ebpf
-	$(DOCKER_PRIVILEGED) cargo test -p edge-lb $(TEST_ARGS)
+	$(DOCKER_PRIVILEGED) env RUST_TEST_THREADS=1 cargo test -p edge-lb $(TEST_ARGS)
 
 ebpf:
 	cargo +$(EBPF_TOOLCHAIN) build -Z build-std=core --target $(EBPF_TARGET) -p edge-lb-ebpf --release

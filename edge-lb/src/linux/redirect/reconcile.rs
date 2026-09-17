@@ -20,9 +20,9 @@ pub struct RedirectContext {
     pub marker_priority: u16,
 }
 
-pub(super) fn refresh(context: &RedirectContext, events: &RouteEvents) -> Result<()> {
+pub(super) fn refresh(context: &RedirectContext, events: &RouteEvents) -> Result<bool> {
     if !context.route_pin.try_exists()? {
-        return Ok(());
+        return Ok(false);
     }
     let started = monotonic_ns()?;
     let (token, targets) = maps::snapshot(&context.route_pin)?;
@@ -58,7 +58,7 @@ pub(super) fn refresh(context: &RedirectContext, events: &RouteEvents) -> Result
     // Notifications queued during a slow observation invalidate its token.
     if events.pending()? {
         maps::invalidate_routes(&context.route_pin)?;
-        return Ok(());
+        return Ok(false);
     }
     ensure!(
         monotonic_ns()? < started.saturating_add(planner::LEASE_NS),
@@ -72,7 +72,7 @@ pub(super) fn refresh(context: &RedirectContext, events: &RouteEvents) -> Result
         &locals,
         monotonic_ns()?,
     )?;
-    Ok(())
+    Ok(true)
 }
 
 pub(super) fn monotonic_ns() -> Result<u64> {
