@@ -26,6 +26,8 @@ struct ManagedHookState {
 
 static LAST_MANAGED_HOOK_STATE: OnceLock<Mutex<BTreeMap<PathBuf, ManagedHookState>>> =
     OnceLock::new();
+#[cfg(test)]
+static TEST_HOOK_FAILURE: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeHaState {
@@ -41,6 +43,12 @@ pub struct NativeHaState {
 pub struct SwitchActiveResult {
     pub gateway: String,
     pub vip: Option<String>,
+    pub garp_announced: bool,
+    pub vip_bound: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalHaRoleResult {
     pub garp_announced: bool,
     pub vip_bound: bool,
 }
@@ -240,43 +248,25 @@ fn switch_active_gateway_inner(
         notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
     }
 
-    write_active_gateway(cfg, &target.name)?;
-
     let mut garp_announced = false;
     let mut vip_now_bound = false;
     let vip = ha_cfg.vip.private_vip.clone();
-    if ha_cfg.enabled
-        && matches!(ha_cfg.vip.provider, VipProvider::L2)
-        && let Some(vip) = vip.as_deref()
-    {
-        let vip = vip
-            .parse()
-            .with_context(|| format!("bad private VIP {vip}"))?;
-        if target.name == cfg.node_name {
-            // Promote: bind the VIP so the kernel accepts VPC ingress for it,
-            // then re-point the L2 network at this node.
-            let device = vip_device(cfg, ha_cfg.vip.bind_device);
-            crate::linux::addr::bind_vip_on_device(cfg, vip, &device)?;
-            vip_now_bound = true;
-            crate::runtime::ka_hook::announce_vip(cfg, vip, &ha_cfg.vip)?;
-            garp_announced = true;
+
+    if ha_cfg.enabled {
+        if target_is_local {
+            let applied = apply_local_ha_role(cfg, &ha_cfg, true, true)?;
+            garp_announced = applied.garp_announced;
+            vip_now_bound = applied.vip_bound;
+            write_active_gateway(cfg, &target.name)?;
         } else {
-            // Demote to the peer: drop the address so the pair never holds
-            // it twice; the new MASTER's GARP claims the network.
-            let device = vip_device(cfg, ha_cfg.vip.bind_device);
-            crate::linux::addr::release_vip_on_device(cfg, vip, &device)?;
+            let applied = apply_local_ha_role(cfg, &ha_cfg, false, true)?;
+            garp_announced = applied.garp_announced;
+            vip_now_bound = applied.vip_bound;
+            notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
+            write_active_gateway(cfg, &target.name)?;
         }
-    }
-    if ha_cfg.enabled && matches!(ha_cfg.vip.provider, VipProvider::Hook) {
-        let role = if target.name == cfg.node_name {
-            "MASTER"
-        } else {
-            "BACKUP"
-        };
-        apply_managed_hook_state(cfg, &ha_cfg, role, None, true)?;
-    }
-    if ha_cfg.enabled && !target_is_local {
-        notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
+    } else {
+        write_active_gateway(cfg, &target.name)?;
     }
 
     Ok(SwitchActiveResult {
@@ -314,6 +304,58 @@ fn notify_peers_of_active_gateway(
         bail!("failover target is not the configured HA peer");
     }
     Ok(())
+}
+
+pub(crate) fn apply_local_ha_role(
+    cfg: &Config,
+    ha_cfg: &ha::GatewayHaRuntimeConfig,
+    local_active: bool,
+    force_hook: bool,
+) -> Result<LocalHaRoleResult> {
+    if !ha_cfg.enabled {
+        return Ok(LocalHaRoleResult::default());
+    }
+    if matches!(ha_cfg.vip.provider, VipProvider::Hook) {
+        let role = if local_active { "MASTER" } else { "BACKUP" };
+        apply_managed_hook_state(cfg, ha_cfg, role, None, force_hook)?;
+        return Ok(LocalHaRoleResult::default());
+    }
+    if !matches!(ha_cfg.vip.provider, VipProvider::L2) {
+        return Ok(LocalHaRoleResult::default());
+    }
+    let Some(vip_text) = ha_cfg.vip.private_vip.as_deref() else {
+        return Ok(LocalHaRoleResult::default());
+    };
+    let vip = vip_text
+        .parse()
+        .with_context(|| format!("bad private VIP {vip_text}"))?;
+    let device = vip_device(cfg, ha_cfg.vip.bind_device);
+    let bound = crate::linux::addr::vip_bound_on_device(cfg, vip, &device);
+    if local_active {
+        if !bound {
+            crate::linux::addr::bind_vip_on_device(cfg, vip, &device)?;
+            crate::runtime::ka_hook::announce_vip(cfg, vip, &ha_cfg.vip)?;
+            tracing::info!(
+                "[ha] VIP {} bound to {} and announced with GARP",
+                vip,
+                device
+            );
+            return Ok(LocalHaRoleResult {
+                garp_announced: true,
+                vip_bound: true,
+            });
+        }
+        return Ok(LocalHaRoleResult {
+            vip_bound: true,
+            ..LocalHaRoleResult::default()
+        });
+    }
+    if bound {
+        crate::linux::addr::release_vip_on_device(cfg, vip, &device)?;
+        tracing::info!("[ha] VIP {} released from {}", vip, device);
+        return Ok(LocalHaRoleResult::default());
+    }
+    Ok(LocalHaRoleResult::default())
 }
 
 pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
@@ -484,7 +526,23 @@ fn run_hook_program(
         state,
         vip
     ));
+    let mut failure = TEST_HOOK_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    if failure.as_deref() == Some(action) {
+        *failure = None;
+        bail!("test managed HA {action} hook failure");
+    }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_hook_failure(action: Option<&'static str>) {
+    *TEST_HOOK_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = action;
 }
 
 #[cfg(test)]
@@ -530,6 +588,7 @@ mod tests {
         if let Some(lock) = LAST_MANAGED_HOOK_STATE.get() {
             lock.lock().unwrap().clear();
         }
+        set_test_hook_failure(None);
         test_hook_events().lock().unwrap().clear();
     }
 
@@ -643,6 +702,46 @@ mod tests {
             ]
         );
         assert!(!take_state_dirty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn local_switch_does_not_commit_active_state_when_promote_hook_fails() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("hook-fail-promote");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        cfg.write_active_gateway("gateway-b").unwrap();
+        set_test_hook_failure(Some("promote"));
+
+        let error = switch_active_gateway(&cfg, "gateway-a").unwrap_err();
+
+        assert!(format!("{error:#}").contains("test managed HA promote hook failure"));
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-b");
+        let events = test_hook_events().lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200"]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remote_switch_does_not_commit_active_state_when_demote_hook_fails() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("hook-fail-demote");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        cfg.write_active_gateway("gateway-a").unwrap();
+        set_test_hook_failure(Some("demote"));
+
+        let error = switch_active_gateway(&cfg, "gateway-b").unwrap_err();
+
+        assert!(format!("{error:#}").contains("test managed HA demote hook failure"));
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
+        let events = test_hook_events().lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["/usr/local/bin/edge-lb-demote:demote:BACKUP:192.0.2.200"]
+        );
         fs::remove_dir_all(dir).ok();
     }
 

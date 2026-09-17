@@ -366,17 +366,22 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
     let Some((active_name, local_active)) = active else {
         return Reply::error(409, "activation target is not a configured gateway");
     };
-    if let Err(e) = crate::provider::native::ha::write_active_gateway(cfg, &active_name) {
-        return Reply::error(500, format!("writing active gateway: {e:#}"));
-    }
     let mut garp_announced = false;
     let mut vip_bound = false;
     if ha_cfg.enabled {
-        let changed = match crate::provider::native::ha::reconcile_vip_after_activation(cfg) {
-            Ok(changed) => changed,
+        let applied = match crate::provider::native::ha::apply_local_ha_role(
+            cfg,
+            &ha_cfg,
+            local_active,
+            true,
+        ) {
+            Ok(applied) => applied,
             Err(e) => return Reply::error(500, format!("applying HA takeover state: {e:#}")),
         };
+        garp_announced = applied.garp_announced;
+        vip_bound = applied.vip_bound;
         if matches!(ha_cfg.vip.provider, ha::VipProvider::L2)
+            && !local_active
             && let Some(vip_text) = ha_cfg.vip.private_vip.as_deref()
         {
             let vip = match vip_text.parse() {
@@ -388,8 +393,12 @@ pub(in crate::api) fn peer_activate(cfg: &Config, body: &str) -> Reply {
                 ha::VipBindDevice::Underlay => cfg.network().underlay_dev.clone(),
             };
             vip_bound = crate::linux::addr::vip_bound_on_device(cfg, vip, &device);
-            garp_announced = changed && vip_bound;
         }
+        if let Err(e) = crate::provider::native::ha::write_active_gateway(cfg, &active_name) {
+            return Reply::error(500, format!("writing active gateway: {e:#}"));
+        }
+    } else if let Err(e) = crate::provider::native::ha::write_active_gateway(cfg, &active_name) {
+        return Reply::error(500, format!("writing active gateway: {e:#}"));
     }
     Reply::json(
         200,
@@ -505,7 +514,7 @@ mod tests {
     };
 
     use crate::config::{ActiveSource, FileConfig, GatewayNode, HaConfig, NetworkConfig, NodeRole};
-    use crate::runtime::ha::GatewayHaPeer;
+    use crate::runtime::ha::{GatewayHaPeer, VipConfig, VipProvider};
 
     #[test]
     fn peer_status_refresh_updates_matching_peer_metadata() {
@@ -590,6 +599,37 @@ mod tests {
         assert_eq!(body["status"], "backup");
         assert_eq!(body["gateway"], "gateway-b");
         assert_eq!(body["local_gateway"], "gateway-a");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn peer_activate_does_not_commit_active_state_when_demote_hook_fails() {
+        let (cfg, dir) = test_gateway_config("peer-activate-demote-fails");
+        cfg.write_active_gateway("gateway-a").unwrap();
+        ha::save_for_state_dir(
+            &dir,
+            &GatewayHaRuntimeConfig {
+                enabled: true,
+                peers: vec![GatewayHaPeer {
+                    name: "gateway-b".to_string(),
+                    underlay_ip: "192.0.2.16".to_string(),
+                    ..GatewayHaPeer::default()
+                }],
+                vip: VipConfig {
+                    provider: VipProvider::Hook,
+                    private_vip: Some("192.0.2.200".to_string()),
+                    ..VipConfig::default()
+                },
+                ..GatewayHaRuntimeConfig::default()
+            },
+        )
+        .unwrap();
+        crate::provider::native::ha::set_test_hook_failure(Some("demote"));
+
+        let reply = peer_activate(&cfg, r#"{"gateway":"gateway-b"}"#);
+
+        assert_eq!(reply.status, 500);
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-a");
         fs::remove_dir_all(dir).ok();
     }
 
