@@ -179,6 +179,21 @@ pub fn handoff_or_release_on_shutdown(cfg: &Config) -> Result<()> {
 }
 
 pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchActiveResult> {
+    switch_active_gateway_inner(cfg, target_key, false)
+}
+
+pub fn switch_active_gateway_coordinated(
+    cfg: &Config,
+    target_key: &str,
+) -> Result<SwitchActiveResult> {
+    switch_active_gateway_inner(cfg, target_key, true)
+}
+
+fn switch_active_gateway_inner(
+    cfg: &Config,
+    target_key: &str,
+    coordinate_local_takeover: bool,
+) -> Result<SwitchActiveResult> {
     let ha_cfg = ha::load_for_state_dir(Path::new(&*cfg.state_dir))?;
     let target = cfg
         .gateway_by_key(target_key)
@@ -205,28 +220,26 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
             })
         })
         .with_context(|| format!("unknown gateway {target_key:?}"))?;
-    if ha_cfg.enabled && target.name != cfg.node_name {
-        let peer = ha_cfg
+
+    let target_is_local = target.name == cfg.node_name || target.underlay_ip == cfg.underlay_ip;
+    let target_underlay = target.underlay_ip.to_string();
+    if ha_cfg.enabled
+        && !target_is_local
+        && !ha_cfg
             .peers
             .iter()
-            .find(|peer| {
-                peer.name == target.name || peer.underlay_ip == target.underlay_ip.to_string()
-            })
-            .context("failover target is not the configured HA peer")?;
-        let response = crate::runtime::ha_write::post_peer_json(
-            cfg,
-            peer,
-            "/api/v1/ha/peer/activate",
-            &serde_json::json!({ "gateway": target.name }),
-        )?;
-        if !(200..300).contains(&response.status) {
-            bail!(
-                "peer activation failed with HTTP {}: {}",
-                response.status,
-                response.body
-            );
-        }
+            .any(|peer| peer.name == target.name || peer.underlay_ip == target_underlay)
+    {
+        bail!("failover target is not the configured HA peer");
     }
+    if ha_cfg.enabled
+        && coordinate_local_takeover
+        && target_is_local
+        && !local_gateway_is_active(cfg)
+    {
+        notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
+    }
+
     write_active_gateway(cfg, &target.name)?;
 
     let mut garp_announced = false;
@@ -262,6 +275,9 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
         };
         apply_managed_hook_state(cfg, &ha_cfg, role, None, true)?;
     }
+    if ha_cfg.enabled && !target_is_local {
+        notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
+    }
 
     Ok(SwitchActiveResult {
         gateway: target.name.clone(),
@@ -269,6 +285,35 @@ pub fn switch_active_gateway(cfg: &Config, target_key: &str) -> Result<SwitchAct
         garp_announced,
         vip_bound: vip_now_bound,
     })
+}
+
+fn notify_peers_of_active_gateway(
+    cfg: &Config,
+    ha_cfg: &ha::GatewayHaRuntimeConfig,
+    active_gateway: &str,
+) -> Result<()> {
+    let mut matched_peer = false;
+    for peer in &ha_cfg.peers {
+        matched_peer = matched_peer || peer.name == active_gateway;
+        let response = crate::runtime::ha_write::post_peer_json(
+            cfg,
+            peer,
+            "/api/v1/ha/peer/activate",
+            &serde_json::json!({ "gateway": active_gateway }),
+        )?;
+        if !(200..300).contains(&response.status) {
+            bail!(
+                "peer active-gateway sync to {} failed with HTTP {}: {}",
+                peer.name,
+                response.status,
+                response.body
+            );
+        }
+    }
+    if !ha_cfg.peers.is_empty() && active_gateway != cfg.node_name && !matched_peer {
+        bail!("failover target is not the configured HA peer");
+    }
+    Ok(())
 }
 
 pub fn handle_ka_hook_event(cfg: &Config, event: &KaHookEvent) -> Result<()> {
