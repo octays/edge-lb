@@ -151,6 +151,7 @@ rate(edge_lb_gateway_native_return_redirect_mutation_error_total[1m])
 | `edge_lb_gateway_native_redirect_stats_available` | gauge | 本次成功读取 map 为 1，否则为 0；不表示准入或发送成功。 |
 | `edge_lb_gateway_native_redirect_admission_status{state,reason}` | gauge | 最近一次自动准入/发布状态，固定输出一条值为 1 的样本；不是每包命中率。 |
 | `edge_lb_gateway_native_redirect_admission_updated_seconds` | gauge | 最近一次自动准入/发布状态更新的 Unix 秒。 |
+| `edge_lb_gateway_native_redirect_map_digest` | gauge | 最近一次成功发布的正向 route、回程 lease 与本机地址集合摘要；不包含短租约过期时间，值为 0 表示尚无成功发布。 |
 | `edge_lb_gateway_native_redirect_submitted_total` | counter | helper 返回 redirect 动作的次数，不等于设备发送成功或端到端成功。 |
 | `edge_lb_gateway_native_redirect_fallback_total{reason}` | counter | 未修改 TTL/L2 前回退的次数，原因见下表。 |
 | `edge_lb_gateway_native_redirect_mutation_error_total` | counter | 开始修改 TTL/L2 后的 helper 错误，此时丢弃而非回退，避免半修改报文进入协议栈。 |

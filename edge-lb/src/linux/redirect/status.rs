@@ -9,6 +9,7 @@ use std::{
 pub struct RedirectAdmissionStatus {
     pub state: &'static str,
     pub reason: &'static str,
+    pub map_digest: u64,
     pub updated_unix_seconds: u64,
 }
 
@@ -17,6 +18,7 @@ impl Default for RedirectAdmissionStatus {
         Self {
             state: "unknown",
             reason: "startup",
+            map_digest: 0,
             updated_unix_seconds: 0,
         }
     }
@@ -31,21 +33,23 @@ pub fn current() -> RedirectAdmissionStatus {
         .clone()
 }
 
-pub(super) fn record_published() {
-    record("published", "none");
+pub(super) fn record_published(map_digest: u64) {
+    record("published", "none", Some(map_digest));
 }
 
 pub(super) fn record_blocked(error: &str) {
-    record("blocked", classify_error(error));
+    record("blocked", classify_error(error), None);
 }
 
-fn record(state: &'static str, reason: &'static str) {
+fn record(state: &'static str, reason: &'static str, map_digest: Option<u64>) {
     let mut status = status()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_digest = status.map_digest;
     *status = RedirectAdmissionStatus {
         state,
         reason,
+        map_digest: map_digest.unwrap_or(previous_digest),
         updated_unix_seconds: now_unix_seconds(),
     };
 }

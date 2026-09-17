@@ -62,7 +62,7 @@ fn run(context: &RedirectContext, stop: &AtomicBool) {
     let mut previous_error = None;
     let mut last_refresh = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Acquire) && !crate::runtime::shutdown::requested() {
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<Option<u64>> {
             if events.is_none() {
                 // No trust survives a receive failure or reconnect attempt.
                 invalidate_routes(pin)?;
@@ -76,14 +76,14 @@ fn run(context: &RedirectContext, stop: &AtomicBool) {
                 last_refresh = Instant::now();
                 return reconcile::refresh(context, events.as_ref().expect("monitor initialized"));
             }
-            Ok(false)
+            Ok(None)
         })();
         match result {
-            Ok(refreshed) => {
-                if refreshed {
-                    status::record_published();
+            Ok(publication) => {
+                if let Some(digest) = publication {
+                    status::record_published(digest);
                 }
-                if refreshed && previous_error.take().is_some() {
+                if publication.is_some() && previous_error.take().is_some() {
                     tracing::info!("[redirect] route invalidation monitor recovered");
                 }
             }
