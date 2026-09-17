@@ -290,11 +290,13 @@ befa56e7387852a78b21e934ae1cd1c2970473d3d31038107725a0b0e0089c08
    先经 B、再经 A 访问同一 8080 服务，A 的回复仍去 B。两套学习 set 都命中，后面的
    OUTPUT 规则覆盖前面的源地址和 mark。补充测试见
    `edge-lb/src/linux/nft/kernel_tests/mod.rs`。这不是只加服务端口就能解决的问题。
-2. **待证：HA 就绪时序。** `api/handlers/ha.rs::peer_activate` 写入 active 选择后
-   直接 reconcile VIP；`provider/native/ha.rs::switch_active_gateway` 接受对端 2xx
-   后继续降级本地，没有等待 datapath generation/flow 状态的就绪确认。另一方面，
+2. **已修正：HA 角色动作早于 active 提交。** patch 分支现在要求
+   `api/handlers/ha.rs::peer_activate` 先执行本机角色变更，再写入 active 选择；
+   `provider/native/ha.rs::switch_active_gateway` 切到对端时先降级本机，远端激活失败
+   则尝试恢复本机 MASTER；切回本机时若本机升主失败，则通知对端恢复原 active。另一方面，
    `provider/native/model.rs::effective_vip_ips` 已为备机安装 shared VIP 的监听，不能
-   简化为“备机没有 VIP map、等待 3 秒才有转发”。是否存在相关竞态需采样证明。
+   简化为“备机没有 VIP map、等待 3 秒才有转发”。跨节点操作 ID/任期、就绪确认和真实
+   双节点故障注入仍需单独验证。
 3. **未证实：上次四次超时的单一根因。** 尚无请求级证据把超时对应到 GARP 收敛、
    双归属误投、旧网关重启或其他环节，不能把隔离测试复现等同于线上故障定位完成。
 
