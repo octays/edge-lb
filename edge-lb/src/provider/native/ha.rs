@@ -30,6 +30,8 @@ static LAST_MANAGED_HOOK_STATE: OnceLock<Mutex<BTreeMap<PathBuf, ManagedHookStat
 static TEST_HOOK_FAILURE: OnceLock<Mutex<Option<&'static str>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_PEER_ACTIVATE_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_PEER_ACTIVATE_LOG: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeHaState {
@@ -233,6 +235,10 @@ fn switch_active_gateway_inner(
 
     let target_is_local = target.name == cfg.node_name || target.underlay_ip == cfg.underlay_ip;
     let target_underlay = target.underlay_ip.to_string();
+    let previous_active = cfg
+        .active_gateway()
+        .ok()
+        .map(|gateway| gateway.name.clone());
     if ha_cfg.enabled
         && !target_is_local
         && !ha_cfg
@@ -242,12 +248,14 @@ fn switch_active_gateway_inner(
     {
         bail!("failover target is not the configured HA peer");
     }
+    let mut peer_notified_for_local_takeover = false;
     if ha_cfg.enabled
         && coordinate_local_takeover
         && target_is_local
         && !local_gateway_is_active(cfg)
     {
         notify_peers_of_active_gateway(cfg, &ha_cfg, &target.name)?;
+        peer_notified_for_local_takeover = true;
     }
 
     let mut garp_announced = false;
@@ -256,7 +264,20 @@ fn switch_active_gateway_inner(
 
     if ha_cfg.enabled {
         if target_is_local {
-            let applied = apply_local_ha_role(cfg, &ha_cfg, true, true)?;
+            let applied = match apply_local_ha_role(cfg, &ha_cfg, true, true) {
+                Ok(applied) => applied,
+                Err(error) if peer_notified_for_local_takeover => {
+                    restore_peer_after_failed_local_takeover(
+                        cfg,
+                        &ha_cfg,
+                        previous_active.as_deref(),
+                        &target.name,
+                        error,
+                    )?;
+                    unreachable!("restore_peer_after_failed_local_takeover always returns Err");
+                }
+                Err(error) => return Err(error),
+            };
             garp_announced = applied.garp_announced;
             vip_now_bound = applied.vip_bound;
             write_active_gateway(cfg, &target.name)?;
@@ -290,6 +311,10 @@ fn notify_peers_of_active_gateway(
         #[cfg(test)]
         if take_test_peer_activate_failure(peer, active_gateway) {
             bail!("test peer active-gateway sync failure");
+        }
+        #[cfg(test)]
+        if record_test_peer_activate(peer, active_gateway) {
+            continue;
         }
         let response = crate::runtime::ha_write::post_peer_json(
             cfg,
@@ -328,6 +353,29 @@ fn restore_local_master_after_failed_handoff(
         );
     }
     Err(handoff_error)
+}
+
+fn restore_peer_after_failed_local_takeover(
+    cfg: &Config,
+    ha_cfg: &ha::GatewayHaRuntimeConfig,
+    previous_active: Option<&str>,
+    target_name: &str,
+    takeover_error: anyhow::Error,
+) -> Result<()> {
+    let Some(previous_active) = previous_active else {
+        return Err(takeover_error);
+    };
+    tracing::warn!(
+        "[ha] local takeover of {} failed after peer demotion: {takeover_error:#}; restoring peer active {}",
+        target_name,
+        previous_active
+    );
+    if let Err(rollback_error) = notify_peers_of_active_gateway(cfg, ha_cfg, previous_active) {
+        bail!(
+            "local takeover of {target_name} failed after peer demotion: {takeover_error:#}; peer role restore to {previous_active} also failed: {rollback_error:#}"
+        );
+    }
+    Err(takeover_error)
 }
 
 pub(crate) fn apply_local_ha_role(
@@ -578,6 +626,24 @@ fn set_test_peer_activate_failure(peer_name: Option<&str>) {
 }
 
 #[cfg(test)]
+fn start_test_peer_activate_log() {
+    *TEST_PEER_ACTIVATE_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(Vec::new());
+}
+
+#[cfg(test)]
+fn take_test_peer_activate_log() -> Vec<String> {
+    TEST_PEER_ACTIVATE_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
 fn take_test_peer_activate_failure(peer: &ha::GatewayHaPeer, active_gateway: &str) -> bool {
     let mut failure = TEST_PEER_ACTIVATE_FAILURE
         .get_or_init(|| Mutex::new(None))
@@ -590,6 +656,19 @@ fn take_test_peer_activate_failure(peer: &ha::GatewayHaPeer, active_gateway: &st
         return false;
     }
     *failure = None;
+    true
+}
+
+#[cfg(test)]
+fn record_test_peer_activate(peer: &ha::GatewayHaPeer, active_gateway: &str) -> bool {
+    let mut log = TEST_PEER_ACTIVATE_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap();
+    let Some(entries) = log.as_mut() else {
+        return false;
+    };
+    entries.push(format!("{}:{active_gateway}", peer.name));
     true
 }
 
@@ -638,6 +717,7 @@ mod tests {
         }
         set_test_hook_failure(None);
         set_test_peer_activate_failure(None);
+        take_test_peer_activate_log();
         test_hook_events().lock().unwrap().clear();
     }
 
@@ -815,6 +895,31 @@ mod tests {
                 "/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200",
                 "/usr/local/bin/edge-lb-verify-vip:verify:MASTER:192.0.2.200",
             ]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn coordinated_local_switch_restores_peer_when_local_promote_fails_after_peer_demote() {
+        reset_test_hooks();
+        let (cfg, dir) = test_gateway_config("local-promote-fails-after-peer-demote");
+        save_hook_ha_config_with_vip(&dir, "192.0.2.200");
+        cfg.write_active_gateway("gateway-b").unwrap();
+        start_test_peer_activate_log();
+        set_test_hook_failure(Some("promote"));
+
+        let error = switch_active_gateway_coordinated(&cfg, "gateway-a").unwrap_err();
+
+        assert!(format!("{error:#}").contains("test managed HA promote hook failure"));
+        assert_eq!(cfg.active_gateway().unwrap().name, "gateway-b");
+        assert_eq!(
+            take_test_peer_activate_log(),
+            vec!["gateway-b:gateway-a", "gateway-b:gateway-b"]
+        );
+        let events = test_hook_events().lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["/usr/local/bin/edge-lb-promote:promote:MASTER:192.0.2.200"]
         );
         fs::remove_dir_all(dir).ok();
     }

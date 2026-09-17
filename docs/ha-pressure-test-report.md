@@ -513,10 +513,11 @@ was a short switchover-window miss rather than a persistent datapath failure.
   service or backend network-path jitter.
 - The `patch` branch now commits local HA role state only after the local
   promote/demote hook or L2 VIP action succeeds, and restores the local role if
-  peer handoff fails after local demotion. Final two-node failover validation
-  should still check `/api/v1/ha/status` and the node address list; lost peer
-  confirmations, late operations, and real fault injection remain separate
-  validation items.
+  peer handoff fails after local demotion. If local takeover fails after peer
+  demotion, it notifies the peer to restore the previous active gateway. Final
+  two-node failover validation should still check `/api/v1/ha/status` and the
+  node address list; lost peer confirmations, late operations, and real fault
+  injection remain separate validation items.
 - The first shell script used a seconds+nanoseconds integer timestamp. On the
   load generator this caused Bash arithmetic edge cases and misleading average
   latency. The script now computes millisecond timestamps with explicit base-10

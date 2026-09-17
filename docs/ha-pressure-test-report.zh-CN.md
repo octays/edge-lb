@@ -477,7 +477,7 @@ backend 分布：
 - 如果需要判断 edge-lb 自身转发延迟，应以 Rust 客户端 `ha-bench` 的 RTT 统计为准；`nc` 脚本主要用于复现手工验证命令和切换窗口可用性。
 - 直接请求 backend 只能用于隔离 backend 服务或网络本身的稳定性，不能作为 HA 压测结论，因为它绕过了 VIP、gateway DNAT/SNAT、VXLAN 回程、主备切换和 xSync。
 - 本次隔离验证中，`192.168.0.14:8080` 直连在 8 并发下也出现 1 秒 timeout，因此正式 HA 压测中的部分失败可能包含 backend 服务或 backend 网络路径自身抖动。
-- `patch` 分支已调整本机 HA 角色提交顺序：本机 promote/demote hook 或 L2 VIP 动作成功后才写入 active 状态；peer handoff 失败时会回滚本机角色。双机切换仍应以 `/api/v1/ha/status` 和目标节点地址绑定检查为最终验收；远端确认丢失、旧操作晚到和真实故障注入仍需单独验证。
+- `patch` 分支已调整本机 HA 角色提交顺序：本机 promote/demote hook 或 L2 VIP 动作成功后才写入 active 状态；peer handoff 失败时会回滚本机角色；本机 takeover 失败时会通知 peer 恢复原 active。双机切换仍应以 `/api/v1/ha/status` 和目标节点地址绑定检查为最终验收；远端确认丢失、旧操作晚到和真实故障注入仍需单独验证。
 - 第一版压测脚本曾使用秒+纳秒的大整数做时间差计算，在压测机 Bash 算术中会出现边界问题并导致平均耗时异常。脚本已改为毫秒时间戳，并显式按十进制解析。
 - 本轮测试前已修复 HA peer metadata 版本展示问题：`/api/v1/ha/status` 会从 live peer status 刷新展示用元数据，两台 gateway 的 peer version 均显示为 `0.1.6`。
 
