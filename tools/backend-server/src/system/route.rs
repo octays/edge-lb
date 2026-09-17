@@ -1,8 +1,8 @@
 //! Default-route ("underlay device") detection.
 //!
 //! Linux: `/proc/net/route`, the 00000000 destination with the lowest metric.
-//! macOS: `route -n get default`. The parse helpers are pure functions so they
-//! can be unit-tested on any platform.
+//! Other platforms: best-effort interface scan. This helper intentionally avoids
+//! shelling out to `ip`, `route`, or similar host commands.
 
 /// Name of the device holding the default route, if it can be determined.
 pub fn default_interface() -> Option<String> {
@@ -16,19 +16,12 @@ fn default_interface_impl() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn default_interface_impl() -> Option<String> {
-    let out = std::process::Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_macos_route_get(&String::from_utf8_lossy(&out.stdout))
+    first_non_loopback_ipv4_interface()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn default_interface_impl() -> Option<String> {
-    None
+    first_non_loopback_ipv4_interface()
 }
 
 /// Parse `/proc/net/route` contents; return the default-route interface.
@@ -45,7 +38,7 @@ pub fn parse_linux_proc_net_route(data: &str) -> Option<String> {
         if f[1] != "00000000" {
             continue; // not the default destination
         }
-        let Ok(metric) = u32::from_str_radix(f[6], 16) else {
+        let Ok(metric) = f[6].parse::<u32>() else {
             continue;
         };
         match &best {
@@ -56,14 +49,14 @@ pub fn parse_linux_proc_net_route(data: &str) -> Option<String> {
     best.map(|(_, name)| name)
 }
 
-/// Parse `route -n get default` output; return the interface name.
-#[cfg(any(test, target_os = "macos"))]
-pub fn parse_macos_route_get(out: &str) -> Option<String> {
-    out.lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("interface:"))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+#[cfg(not(target_os = "linux"))]
+fn first_non_loopback_ipv4_interface() -> Option<String> {
+    crate::system::ifaddr::list()
+        .into_iter()
+        .find(|addr| {
+            !addr.is_loopback && matches!(addr.ip, std::net::IpAddr::V4(ip) if !ip.is_unspecified())
+        })
+        .map(|addr| addr.name)
 }
 
 #[cfg(test)]
@@ -99,17 +92,12 @@ docker0\t0000AC1A\t00000000\t0001\t0\t0\t0\tFFFF0000\t0\t0\t0
     }
 
     #[test]
-    fn macos_route_get_parses_interface() {
-        let out = "\
-   route to: default
-destination: default
-       mask: default
-    gateway: 192.168.1.1
-  interface: en0
-      flags: <UP,GATEWAY,DONE,STATIC>
- recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
+    fn linux_route_metric_is_decimal() {
+        let data = "\
+Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT
+eth9\t00000000\t0104010A\t0003\t0\t0\t0x10\t00000000\t0\t0\t0
+eth0\t00000000\t0104010A\t0003\t0\t0\t20\t00000000\t0\t0\t0
 ";
-        assert_eq!(parse_macos_route_get(out), Some("en0".to_string()));
-        assert_eq!(parse_macos_route_get("no interface here\n"), None);
+        assert_eq!(parse_linux_proc_net_route(data), Some("eth0".to_string()));
     }
 }
