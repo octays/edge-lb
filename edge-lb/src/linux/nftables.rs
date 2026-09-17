@@ -2,13 +2,9 @@
 
 use std::{ffi::CString, mem::size_of};
 
-#[cfg(test)]
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::config::Config;
-#[cfg(test)]
-use crate::config::GatewayReturnPath;
+mod transport;
 
 mod transport;
 
@@ -312,15 +308,7 @@ fn rule_body_in_table(table: &str, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> 
     body
 }
 
-#[cfg(test)]
 fn forward_mark_exprs(_cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
-    let mut expressions = ingress_match_exprs(path)?;
-    expressions.extend([counter(), immediate_mark(path.mark), ct_set(NFT_CT_MARK)]);
-    Ok(expressions)
-}
-
-#[cfg(test)]
-fn ingress_match_exprs(path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
     let dscp = path.dscp;
     // Out-of-range dscp used to be truncated to a DSCP-0 match here, which
     // silently matched nothing and dropped the connection into the main

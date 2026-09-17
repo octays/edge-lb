@@ -20,16 +20,9 @@
 - DNAT 必须使用目标组显式配置的业务地址；仅按 backend 名称引用且地址未指定时，
   才解析为该 backend 的 underlay IP。健康探测、健康状态身份和 native target 使用同一
   解析语义，不得自动用 backend overlay 替换业务地址。
-- backend return path 的目标实现只有 Redirect，不引入 `return_engine` 配置项，也不
-  保留 nftables 与 Redirect 双模式兼容语义。当前已部署版本中的 nftables return path
-  只能作为迁移前事实记录，不能作为 `patch` 分支最终验收路径。运行时代码不得自动
-  删除旧 nftables table、policy rule、route table 或 `/etc/iproute2/rt_tables`
-  条目；如需从旧版本迁移，按迁移文档人工处理。
-- backend Redirect 必须只从已订阅 VXLAN/DSCP contract 和实际数据包学习回程归属；
-  不依赖 L4 业务端口下发或 active gateway 状态。reply 方向经 VXLAN 返回请求所属
-  gateway；不改写业务源 IP。
-- backend 收到配置不变的 xDS snapshot 只能 ACK 并保持现有 Redirect 程序和 map 状态；
-  不得触发 VXLAN、Redirect attach/map publish 或 policy-route churn。
+- backend 在所有 IPv4 ingress 的 conntrack original 方向按已订阅 DSCP 设置 ct mark，
+  不依赖 VXLAN ingress 设备、L4 协议、业务端口或 active gateway。reply 方向只恢复
+  当前有效 contract 的 routing fwmark，经 VXLAN 返回 gateway；不改写业务源 IP。
 - DSCP 是受信网络内的回程分类标记，不是身份认证。直连流量若携带相同 DSCP，也会
   被分类；部署方必须隔离这些 codepoint，不能再声称“同 DSCP 直连一定不被接管”。
   contract DSCP 必须为 1..63，多个 gateway 的 DSCP、非零 mark 和路由表不能冲突。

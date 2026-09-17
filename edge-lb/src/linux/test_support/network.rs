@@ -21,12 +21,16 @@ where
     F: FnOnce(Handle) -> Fut + Send,
     Fut: Future<Output = anyhow::Result<T>> + Send,
 {
-    crate::linux::net::run_netlink(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
-        tokio::time::timeout(Duration::from_secs(3), action(handle)).await?
-    })
-    .unwrap()
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let (connection, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(connection);
+            tokio::time::timeout(Duration::from_secs(3), action(handle)).await?
+        })
+        .unwrap()
 }
 
 pub(in crate::linux) fn index(dev: &str) -> u32 {
