@@ -8,6 +8,7 @@
 #![no_std]
 #![no_main]
 
+mod backend_redirect;
 mod nat;
 mod redirect;
 mod redirect_packet;
@@ -83,6 +84,32 @@ unsafe fn bpf_get_hash_recalc(skb: *mut __sk_buff) -> u32 {
     let fun: unsafe extern "C" fn(skb: *mut __sk_buff) -> u32 =
         unsafe { core::mem::transmute(34usize) };
     unsafe { fun(skb) }
+}
+
+#[classifier]
+pub fn backend_return_ingress(ctx: TcContext) -> i32 {
+    match try_backend_return_ingress(ctx) {
+        Ok(action) => action,
+        Err(_) => TC_ACT_PIPE,
+    }
+}
+
+fn try_backend_return_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
+    let now = unsafe { bpf_ktime_get_ns() };
+    Ok(backend_redirect::ingress(&mut ctx, now))
+}
+
+#[classifier]
+pub fn backend_return_egress(ctx: TcContext) -> i32 {
+    match try_backend_return_egress(ctx) {
+        Ok(action) => action,
+        Err(_) => TC_ACT_PIPE,
+    }
+}
+
+fn try_backend_return_egress(mut ctx: TcContext) -> Result<i32, c_long> {
+    let now = unsafe { bpf_ktime_get_ns() };
+    Ok(backend_redirect::egress(&mut ctx, now))
 }
 
 #[classifier]

@@ -1,5 +1,4 @@
-//! Backend node: VXLAN return tunnel, DSCP/ct-mark steering and policy
-//! routing, mirroring the verified procedure in docs/vxlan-dscp-verified.md.
+//! Backend node: VXLAN return tunnel and Redirect-only return steering.
 //!
 //! Original-direction connections with a subscribed DSCP select a VXLAN
 //! return path. DSCP is a trusted-network classifier, not authentication.
@@ -56,7 +55,7 @@ fn apply_with(
     crate::linux::sysctl::ensure_backend_datapath_tuning()
         .with_context(|| "applying backend datapath sysctl tuning")?;
     tracing::info!(
-        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} return_paths={} return_engine=nftables",
+        "[backend] apply node={} return_dev={} underlay_dev={} underlay_ip={} public_ip={} overlay={} gateway_reference={} gateway_underlay={} gateway_overlay={} overlay_cidr={} vni={} vxlan_port={} mtu={} return_paths={} return_path=redirect",
         cfg.node_name,
         n.vxlan_dev,
         n.underlay_dev,
@@ -101,7 +100,6 @@ fn apply_with(
             n.vxlan_port,
         );
     }
-    net::ensure_rt_tables(cfg)?;
     let return_path_guard = if managed {
         Some(return_path::apply_managed_reusing(cfg, existing)?)
     } else {
@@ -110,27 +108,12 @@ fn apply_with(
         None
     };
     if return_paths.is_empty() {
-        tracing::info!("[backend] return-path engine nftables cleared: no gateway return paths");
+        tracing::info!("[backend] return-path Redirect cleared: no gateway return paths");
     } else {
         tracing::info!(
-            "[backend] return-path engine nftables applied (nft table inet {})",
-            cfg.backend_cfg().nft_table
-        );
-    }
-    return_path::ensure_policy_routing(cfg)?;
-    if return_paths.is_empty() {
-        tracing::info!("[backend] policy routing cleared: no gateway return paths");
-    } else if let Some((_, peers)) = multipoint_return_vxlan(cfg) {
-        tracing::info!(
-            "[backend] policy routing: per-gateway return paths applied for {} gateway peer(s)",
-            peers.len()
-        );
-    } else {
-        tracing::info!(
-            "[backend] policy routing: fwmark {} -> table {} via {}",
-            cfg.backend_cfg().fwmark,
-            cfg.backend_cfg().route_table,
-            cfg.gateway_overlay_ip()?,
+            "[backend] return-path Redirect applied ({} ingress -> {} egress)",
+            n.underlay_dev,
+            n.underlay_dev
         );
     }
     Ok(return_path_guard)
@@ -214,15 +197,15 @@ pub fn show(cfg: &Config) -> Result<()> {
         net::link_mtu(&n.vxlan_dev).unwrap_or_default(),
         net::vxlan_remote(&n.vxlan_dev)
     );
-    section("policy routing");
+    section("legacy policy routing");
     println!(
         "managed rule present={}",
         crate::linux::route::policy_rule_present(cfg)
     );
     let b = cfg.backend_cfg();
-    section(&format!("route table {}", b.route_table));
-    println!("managed return routes are reconciled through rtnetlink");
-    section(&format!("nft table inet {}", b.nft_table));
+    section(&format!("legacy route table {}", b.route_table));
+    println!("not managed by Redirect-only backend runtime");
+    section(&format!("legacy nft table inet {}", b.nft_table));
     println!("present={}", crate::linux::nftables::table_exists(cfg));
     Ok(())
 }
@@ -241,11 +224,8 @@ fn backend_gateway_reference(cfg: &Config) -> Result<GatewayNode> {
 pub fn cleanup(cfg: &Config) -> Result<()> {
     privilege::require_root()?;
     let n = cfg.network();
-    let b = cfg.backend_cfg();
     return_path::cleanup(cfg)?;
-    tracing::info!("[backend] nft table inet {} deleted", b.nft_table);
-    tracing::info!("[backend] ip rule {} removed", b.rule_priority);
-    tracing::info!("[backend] route table {} cleaned", b.route_table);
+    tracing::info!("[backend] return-path Redirect tc programs and maps removed");
     if net::link_exists(&n.vxlan_dev) {
         net::delete_link(&n.vxlan_dev)
             .with_context(|| format!("failed to delete {}", n.vxlan_dev))?;
@@ -254,8 +234,8 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
         tracing::info!("[backend] {} not present", n.vxlan_dev);
     }
     let _ = std::fs::remove_file(metrics_path(cfg));
-    // Application-owned NAT rules and /etc/iproute2/rt_tables are intentionally
-    // left alone.
+    // Legacy nftables, policy-route, and /etc/iproute2/rt_tables state is
+    // intentionally left alone. See the Redirect-only migration guide.
     Ok(())
 }
 
@@ -399,13 +379,11 @@ fn vxlan_spec<'a>(cfg: &'a Config, remote: IpAddr, overlay: &'a str) -> VxlanSpe
     }
 }
 
-/// Switch the return path to a new active gateway (remote + routes only;
-/// nft rules and the rule itself are gateway-agnostic).
+/// Switch the return VXLAN remote for the single-peer mode.
 fn switch_active(cfg: &Config, gw: &GatewayNode) -> Result<()> {
     let overlay = cfg.local_backend()?.overlay_ip.clone();
     let spec = vxlan_spec(cfg, gw.underlay_ip, &overlay);
     net::set_vxlan_remote(&spec, gw.underlay_ip)?;
-    return_path::ensure_policy_routing(cfg)?;
     Ok(())
 }
 

@@ -106,6 +106,7 @@ struct NlMsgErr {
     error: i32,
 }
 
+#[cfg(test)]
 pub fn ensure_policy_routing(cfg: &Config) -> Result<()> {
     let _lock = ownership_lock(cfg)?;
     let mut ownership = RouteOwnership::load()?;
@@ -435,6 +436,7 @@ fn reconcile_on_socket(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn cleanup_policy_routing(cfg: &Config) {
     let result = (|| -> Result<()> {
         let _lock = ownership_lock(cfg)?;

@@ -6,9 +6,18 @@
 
 ## 状态与目标
 
-本文的 backend fast path 尚未实现、部署或证明有性能收益；`patch` 已完成两台测试
-backend 的网络模式核查，并新增真实 nft/VXLAN 慢路径基线回归。发现的 UDP 归属歧义
-仍未修复，不能据此启用 redirect。架构变更须先同步并得到确认，再进入实现。
+本文记录 `patch` 分支 backend Redirect-only 回程优化。旧 nftables/policy-route
+回程只作为迁移前事实和基线，不再作为最终运行路径；运行时代码只管理当前版本的 TC
+eBPF 程序和 pinned map，不自动删除旧 nftables table、policy rule、route table 或
+`/etc/iproute2/rt_tables` 条目。旧状态清理按
+[迁移说明](backend-redirect-only-migration.md) 人工执行。
+
+当前实现采用 backend `underlay_dev ingress` 学习可信 DSCP 请求，`underlay_dev
+egress` 命中反向 tuple 后通过 `bpf_redirect()` 送入 `edge-return` VXLAN 设备。回程
+目的 gateway 来自已订阅 VXLAN/DSCP contract，二层下一跳由 userspace 观测 gateway
+overlay 路由和邻居项后写入 eBPF map，不从业务端口、target group 或 active gateway
+状态派生。
+
 gateway 的 TC direct redirect 方案见
 [正向设计](tc-direct-redirect-fast-path-plan.md)，解封装后的客户端转发见
 [gateway 回程设计](gateway-return-path-optimization-plan.md)。
@@ -17,7 +26,8 @@ gateway 的 TC direct redirect 方案见
 [UDP 回程归属诊断](udp-return-ownership-diagnosis.md)。UDP 生产语义仍未修改。
 
 开发在 `patch` 分支进行，全部实现并完成验证后再合并 `master`。不增加运行期开关、
-环境变量或构建 feature；满足条件自动加速，不满足条件自动保持已验证的原有路径。
+环境变量、构建 feature 或 `return_engine` 配置项；最终 backend return path 只保留
+Redirect，不保留 nftables/Redirect 双模式兼容语义。
 
 目标是减少 backend 回包进入 VXLAN 之前的转发开销。需区分两种实际拓扑：
 
@@ -35,7 +45,9 @@ gateway 的 TC direct redirect 方案见
   target group、负载均衡算法或 active gateway 状态。
 - 回程归属来自可信请求中的 VXLAN/DSCP 信号，业务 tuple 来自实际数据包学习。
   本地学习端口不等于控制面下发服务端口。
-- 使用同一套 contract 派生现有路径和快速路径，不建立第二套管理资源或配置语义。
+- 使用同一套 contract 派生 Redirect 状态，不建立第二套管理资源或配置语义。
+- backend 不提供 `return_engine` 选择，不允许用户在 nftables 与 Redirect 之间切换。
+  nftables 只作为当前已部署版本和迁移前基线的事实描述，不是最终验收路径。
 - backend 不重新选择负载均衡目标，也不自行推断哪个 gateway 是 MASTER。
 - 保持 gateway 现有 flow key、reverse NAT、HA xSync 和 flow persistence 语义。
 - 继续使用内核 VXLAN 封装；本阶段不手工拼装外层报文。
@@ -45,32 +57,30 @@ gateway 的 TC direct redirect 方案见
 
 主要代码：
 
-- `edge-lb/src/linux/nft.rs`：从 VXLAN ingress 的 DSCP 设置 ct mark；学习 UDP
-  客户端地址和端口；在回程恢复 fwmark，必要时修正 UDP 源地址。
-- `edge-lb/src/linux/route.rs`：fwmark 对应的策略路由和经 gateway overlay 的默认路由。
-- `edge-lb/src/linux/return_path.rs`：应用、巡检和清理现有 nft/route 状态。managed
-  apply 已记录 nft ruleset 签名；nft table、VXLAN 设备、MSS 和 return paths 未变化且表仍存在时，
-  跳过 nft table 重建，只继续由外层确保策略路由。
+- `edge-lb/src/linux/backend_redirect.rs`：加载 backend Redirect eBPF、解析 gateway
+  overlay 路由邻居、发布 DSCP contract map，并挂载 backend underlay ingress/egress TC。
+- `edge-lb/src/linux/return_path.rs`：Redirect-only facade，只调用
+  `backend_redirect::apply/cleanup/heal`，不再应用 nft/policy-route。
+- `edge-lb-ebpf/src/backend_redirect.rs`：ingress 根据 DSCP 学习反向 tuple；egress
+  命中后只改 Ethernet header，并 `bpf_redirect()` 到 VXLAN ifindex。
 - `edge-lb/src/role/backend.rs`：VXLAN 设备、peer 和本地 overlay 地址管理。
 
 ```mermaid
 flowchart TD
-    IN[请求到达 backend VXLAN ingress] --> DSCP[根据 DSCP 匹配 return-path contract]
-    DSCP --> STATE[记录 ct mark / UDP 客户端 tuple]
-    STATE --> APP[backend 服务]
-    APP --> MODE{服务网络模式}
-    MODE -->|host| OUTPUT[宿主机 OUTPUT<br/>UDP 源地址修正 / 恢复 fwmark]
-    MODE -->|独立容器网络| VETH[容器协议栈 / 宿主机侧 veth ingress]
-    VETH --> PRE[宿主机 bridge / PREROUTING<br/>按实际拓扑处理回包]
-    PRE --> MARK[恢复回程 fwmark]
-    OUTPUT --> ROUTE[策略路由]
-    MARK --> ROUTE
-    ROUTE --> VX[edge-return VXLAN 封装]
-    VX --> NIC[underlay 发送到对应 gateway]
+    REQ[请求到达 backend underlay ingress] --> DSCP[匹配已订阅 DSCP contract]
+    DSCP --> LEARN[学习反向 tuple<br/>保存 VXLAN ifindex 和 overlay 下一跳 MAC]
+    LEARN --> APP[backend 服务]
+    APP --> OUT[响应准备从 underlay_dev egress 发出]
+    OUT --> HIT{反向 tuple 命中?}
+    HIT -->|是| L2[改写 Ethernet dst/src]
+    L2 --> REDIRECT[bpf_redirect 到 edge-return]
+    REDIRECT --> VX[内核 VXLAN 封装]
+    VX --> GW[请求所属 gateway]
+    HIT -->|否| PIPE[保持原路径]
 ```
 
-图中容器路径是待核实的拓扑分支，不表示所有 bridge/CNI/NAT 组合已受支持。当前 UDP
-源地址修正规则位于宿主机 OUTPUT，不能假设该规则也会修复容器转发回包。
+该路径不依赖 backend 感知 listener 服务端口或 active gateway；请求从哪个 gateway
+过来由可信 DSCP contract 分类，回程通过对应 gateway overlay 邻居返回。
 
 ## 候选范围与收益边界
 
@@ -87,7 +97,7 @@ conntrack 和路由工作。
 host 网络后续若评估 cgroup/socket hook，必须先明确内核能力、TCP/UDP 覆盖、路由查询
 时机和 UDP 源地址语义，并单独评审。本方案不把尚未验证的早期 hook 作为交付承诺。
 
-## 容器网络 PoC 路径
+## Redirect-only 目标路径
 
 准入条件：容器无需依赖被跳过的 NAT、过滤、限速或网络策略；回包 tuple 能与可信请求
 建立无歧义对应；现有慢路径在该拓扑中已通过 TCP/UDP 验证。
@@ -103,13 +113,12 @@ flowchart TD
     PREP --> TUNNEL[选择对应 VXLAN 回程并 redirect]
     TUNNEL --> OUT[内核封装与外层发送]
     OUT --> GW[请求所属 gateway]
-    CHECK -->|否，且慢路径已验证可用| PIPE[TC_ACT_PIPE]
-    PIPE --> OLD[现有 nft / 策略路由]
-    OLD --> OUT
+    CHECK -->|否| DROP_OR_PIPE[按错误边界处理<br/>未改写前可 PIPE，已改写后丢弃]
 ```
 
-该路径不绕过容器内部协议栈，也不等于绕过整个主机上的所有 conntrack 或 nft。
-某些 CNI 的 NAT、策略或限速正处于拟绕过的位置；未证明语义等价的环境不启用 PoC。
+该路径不绕过容器内部协议栈，也不等于绕过整个主机上的所有内核处理。
+某些 CNI 的 NAT、策略或限速正处于拟绕过的位置；未证明语义等价的环境不能作为
+Redirect-only 验收环境。
 
 ## 回程状态学习
 
@@ -140,7 +149,7 @@ ifindex 直接当作同一个网络域标识；请求学习点与回包 hook 必
 
 现有 nft UDP set 的 key 是客户端 IP/端口，且每条 return path 独立维护。它不能证明
 完整 tuple 不冲突。因此不能用“BPF miss 后交给 nft”掩盖双 gateway 同 tuple 歧义；
-该场景须先验证慢路径本身的行为，不满足要求时阻止启用快速路径。
+Redirect-only 实现必须在自身学习状态中解决或显式拒绝该场景。
 
 ### 生命周期
 
@@ -182,21 +191,20 @@ metadata 的能力。若现有设备无法满足定向发送，再提交 metadat
 丢弃或恢复处理，不能把半改写报文直接交给旧路径；redirect 提交后发生的发送失败也
 无法在同一次程序调用里重新回退。
 
-PoC 保留现有 nft 学习规则，请求仍更新慢路径所需状态。两条执行路径使用相同 contract
-和回程归属语义，不能各自定义冲突时的选择规则。
+Redirect-only 不保留现有 nft 学习规则作为运行期兜底。请求学习、冲突判定和回程归属
+只能有一套语义，不能把 Redirect miss 转交给 nft 后形成两套选择规则。
 
 | 情况 | 处理要求 |
 |---|---|
-| 快速路径未就绪或拓扑不满足条件 | 自动使用已验证的现有 nft/策略路由 |
-| 学习未命中、过期或 map 压力 | 在慢路径有正确归属的前提下回退，并计数 |
-| tuple 歧义或慢路径归属也缺失 | 不保证回退成功；作为准入阻断或业务失败暴露 |
+| Redirect 未就绪或拓扑不满足条件 | 拒绝进入最终验收；迁移阶段可回滚到旧版本，但不作为同一版本运行模式 |
+| 学习未命中、过期或 map 压力 | 未改写前可交回内核；已开始改写后必须丢弃或完整恢复，且计数 |
+| tuple 歧义 | 显式拒绝发布对应状态或计数暴露，不能按规则顺序或隐式 fallback 选择 |
 | peer/contract 变更 | 使旧快速状态失效，先确认慢路径收敛再恢复加速 |
-| backend 进程重启 | 先确认设备和 nft 状态，再挂载程序并自动判断快速路径准入 |
-| 主机重启或 nft 状态清空 | 需要新请求重建归属；不承诺已有会话自动恢复 |
+| backend 进程重启 | 挂载 Redirect 程序并等待新请求重建归属；不承诺已有 backend 本地状态自动恢复 |
+| 主机重启 | 需要新请求重建归属；不承诺已有会话自动恢复 |
 
-现有 `nft::apply` 通过重建表应用规则，动态 UDP set 可能随之丢失。因此快速路径的挂载和
-就绪状态变化不应触发不必要的 nft 表重建；部署、巡检和配置变更是否清空学习状态必须
-纳入测试。
+旧 `nft::apply` 会通过重建表清空动态学习状态；该行为只用于迁移前基线分析。
+Redirect-only 的挂载、巡检和配置变更必须有自己的状态生命周期测试。
 
 ## 观测与验证
 
@@ -275,12 +283,13 @@ printf 'discover\n' | nc -N -w 5 <vip> <service-port>
 2. 在隔离的独立容器网络中验证慢路径，确认无必需 NAT/策略被绕过。
 3. 完成 tuple 归一化、冲突规则和设备投影设计，提交架构确认。
 4. 在中间提交实现只学习和计数的 shadow 阶段，验证与现有回程归属一致；不保留用户模式开关。
-5. 接入条件满足时自动执行的 redirect，完成报文、状态生命周期与回退测试。
+5. 接入 Redirect-only，完成报文、状态生命周期与错误边界测试。
 6. 完成性能对照和两端完整回归后再合并 `master`，中间实现仅在 `patch` 验证。
 
 验收要求：backend xDS contract 无新增业务信息；不误加速排除场景；没有新增错路由、
-跨 gateway 误投或 UDP 源地址错误；自动回退时慢路径可用；性能收益超过重复测试波动。
-不预设提升百分比，未测得收益则保留当前实现。
+跨 gateway 误投或 UDP 源地址错误；没有 `return_engine` 配置或 nft/Redirect 双模式；
+性能收益超过重复测试波动。不预设提升百分比，未测得收益则回滚该 patch，而不是在
+同一版本中保留可配置 nft fallback。
 
 ## P3 前置核查与回归（2026-09-16）
 

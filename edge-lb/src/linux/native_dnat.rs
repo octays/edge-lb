@@ -2,7 +2,8 @@
 //!
 //! The daemon owns the Aya object and its maps. The ingress program performs
 //! the forward rewrite and the return program restores the listener source on
-//! packets arriving from the backend overlay.
+//! packets arriving from the backend overlay or directly from the backend
+//! underlay path.
 
 use std::{
     collections::{BTreeMap, HashMap as StdHashMap, HashSet},
@@ -102,12 +103,21 @@ impl Drop for NativeDnatAttachment {
             TcAttachType::Ingress,
             NATIVE_DNAT_RETURN_PROGRAM,
         );
+        let _ = qdisc_detach_program(
+            &self.underlay,
+            TcAttachType::Ingress,
+            NATIVE_DNAT_RETURN_PROGRAM,
+        );
         crate::linux::tc::delete_ingress_pref_best_effort(
             &self.underlay,
             self.pref + INGRESS_PREF_OFFSET,
         );
         crate::linux::tc::delete_ingress_pref_best_effort(
             &self.overlay,
+            self.pref + RETURN_PREF_OFFSET,
+        );
+        crate::linux::tc::delete_ingress_pref_best_effort(
+            &self.underlay,
             self.pref + RETURN_PREF_OFFSET,
         );
         for name in MAPS {
@@ -273,12 +283,19 @@ fn attach_prepared(cfg: &Config, mut bpf: Ebpf) -> Result<NativeDnatAttachment> 
     crate::linux::tc::add_clsact_best_effort(&n.underlay_dev);
     crate::linux::tc::add_clsact_best_effort(&n.vxlan_dev);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + INGRESS_PREF_OFFSET);
+    crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + RETURN_PREF_OFFSET);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.vxlan_dev, pref + RETURN_PREF_OFFSET);
     attach_program(
         &mut bpf,
         NATIVE_DNAT_INGRESS_PROGRAM,
         &n.underlay_dev,
         pref + INGRESS_PREF_OFFSET,
+    )?;
+    attach_program(
+        &mut bpf,
+        NATIVE_DNAT_RETURN_PROGRAM,
+        &n.underlay_dev,
+        pref + RETURN_PREF_OFFSET,
     )?;
     attach_program(
         &mut bpf,
@@ -817,7 +834,21 @@ pub fn dump_flows(cfg: &Config) -> Result<Vec<FlowEntry>> {
     Ok(out)
 }
 
+pub fn native_config_uses_least_connections(cfg: &Config) -> Result<bool> {
+    Ok(listeners_from_config(cfg)?
+        .iter()
+        .any(|listener| listener.select == crate::config::LbSelect::Lc.code()))
+}
+
+pub fn sweep_flows(cfg: &Config) -> Result<usize> {
+    sweep_flows_inner(cfg, false)
+}
+
 pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
+    sweep_flows_inner(cfg, true)
+}
+
+fn sweep_flows_inner(cfg: &Config, refresh_loads: bool) -> Result<usize> {
     let now = monotonic_now_ns();
     let Some(mut flows) = open_pinned_flows(cfg)? else {
         return Ok(0);
@@ -832,22 +863,26 @@ pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
             expired.push(key);
             continue;
         }
-        let pair = canonical_flow_pair(key, value);
-        if seen_pairs.insert(pair) {
-            let load_key = NativeTargetLoadKey {
-                listener_id: value.listener_id,
-                target_id: value.target_id,
-            };
-            loads
-                .entry(load_key)
-                .and_modify(|load| *load = load.saturating_add(1))
-                .or_insert(1);
+        if refresh_loads {
+            let pair = canonical_flow_pair(key, value);
+            if seen_pairs.insert(pair) {
+                let load_key = NativeTargetLoadKey {
+                    listener_id: value.listener_id,
+                    target_id: value.target_id,
+                };
+                loads
+                    .entry(load_key)
+                    .and_modify(|load| *load = load.saturating_add(1))
+                    .or_insert(1);
+            }
         }
     }
     for key in &expired {
         let _ = flows.remove(key);
     }
-    replace_active_flows(cfg, &loads)?;
+    if refresh_loads {
+        replace_active_flows(cfg, &loads)?;
+    }
     Ok(expired.len())
 }
 
@@ -1059,7 +1094,13 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
         TcAttachType::Ingress,
         NATIVE_DNAT_RETURN_PROGRAM,
     );
+    let _ = qdisc_detach_program(
+        &n.underlay_dev,
+        TcAttachType::Ingress,
+        NATIVE_DNAT_RETURN_PROGRAM,
+    );
     crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + INGRESS_PREF_OFFSET);
+    crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + RETURN_PREF_OFFSET);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.vxlan_dev, pref + RETURN_PREF_OFFSET);
     for name in MAPS {
         let _ = fs::remove_file(pin_path(cfg, name));
@@ -1318,6 +1359,39 @@ mod tests {
                 .len(),
             first_ids.len()
         );
+    }
+
+    #[test]
+    fn native_config_uses_least_connections_only_when_listener_selects_lc() {
+        let mut file = crate::config::FileConfig::default();
+        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
+        file.target_groups.push(crate::config::TargetGroup {
+            name: "targets".to_string(),
+            targets: vec![crate::config::BackendTarget {
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
+                weight: 1,
+                ..crate::config::BackendTarget::default()
+            }],
+            ..crate::config::TargetGroup::default()
+        });
+        file.listeners.push(crate::config::Listener {
+            name: "sip".to_string(),
+            port: 5060,
+            target_port: 5060,
+            target_group: "targets".to_string(),
+            protocols: vec![crate::config::Protocol::Udp],
+            select: crate::config::LbSelect::ConsistentHash,
+            ..crate::config::Listener::default()
+        });
+        let mut cfg = crate::config::Config {
+            file,
+            path: crate::config::DEFAULT_CONFIG_PATH.into(),
+        };
+
+        assert!(!super::native_config_uses_least_connections(&cfg).unwrap());
+
+        cfg.file.listeners[0].select = crate::config::LbSelect::Lc;
+        assert!(super::native_config_uses_least_connections(&cfg).unwrap());
     }
 
     #[test]

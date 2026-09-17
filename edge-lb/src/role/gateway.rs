@@ -542,7 +542,6 @@ fn is_active_gateway(cfg: &Config) -> bool {
 }
 
 pub fn show(cfg: &Config) -> Result<()> {
-    crate::storage::initialize(Path::new(&*cfg.state_dir))?;
     let n = cfg.network();
     section("vxlan device");
     println!(
@@ -561,10 +560,13 @@ pub fn show(cfg: &Config) -> Result<()> {
         n.dscp
     );
     section("native listeners");
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&native::native_listeners_state(cfg)?).unwrap_or_default()
-    );
+    match native::native_listeners_state(cfg) {
+        Ok(state) => println!(
+            "{}",
+            serde_json::to_string_pretty(&state).unwrap_or_default()
+        ),
+        Err(e) => println!("(unavailable: {e:#})"),
+    }
     section("dscp marker stats");
     match dscp::stats(cfg) {
         Ok(s) => println!("matched={} changed={}", s.matched, s.changed),

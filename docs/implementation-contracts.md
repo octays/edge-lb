@@ -20,12 +20,16 @@
 - DNAT 必须使用目标组显式配置的业务地址；仅按 backend 名称引用且地址未指定时，
   才解析为该 backend 的 underlay IP。健康探测、健康状态身份和 native target 使用同一
   解析语义，不得自动用 backend overlay 替换业务地址。
-- backend 在所有 IPv4 ingress 的 conntrack original 方向按已订阅 DSCP 设置 ct mark，
-  不依赖 VXLAN ingress 设备、L4 协议、业务端口或 active gateway。reply 方向只恢复
-  当前有效 contract 的 routing fwmark，经 VXLAN 返回 gateway；不改写业务源 IP。
-- backend managed return-path apply 必须保留上一轮 nft ruleset 签名；nft table、
-  VXLAN 设备、MSS 和 return paths 均未变化且表仍存在时，不得重建 nft 表。配置不变的
-  xDS snapshot 只能继续确保策略路由，不应清空或扰动已有 return-path 状态。
+- backend return path 的目标实现只有 Redirect，不引入 `return_engine` 配置项，也不
+  保留 nftables 与 Redirect 双模式兼容语义。当前已部署版本中的 nftables return path
+  只能作为迁移前事实记录，不能作为 `patch` 分支最终验收路径。运行时代码不得自动
+  删除旧 nftables table、policy rule、route table 或 `/etc/iproute2/rt_tables`
+  条目；如需从旧版本迁移，按迁移文档人工处理。
+- backend Redirect 必须只从已订阅 VXLAN/DSCP contract 和实际数据包学习回程归属；
+  不依赖 L4 业务端口下发或 active gateway 状态。reply 方向经 VXLAN 返回请求所属
+  gateway；不改写业务源 IP。
+- backend 收到配置不变的 xDS snapshot 只能 ACK 并保持现有 Redirect 程序和 map 状态；
+  不得触发 VXLAN、Redirect attach/map publish 或 policy-route churn。
 - DSCP 是受信网络内的回程分类标记，不是身份认证。直连流量若携带相同 DSCP，也会
   被分类；部署方必须隔离这些 codepoint，不能再声称“同 DSCP 直连一定不被接管”。
   contract DSCP 必须为 1..63，多个 gateway 的 DSCP、非零 mark 和路由表不能冲突。
@@ -416,7 +420,8 @@ backend binding alive while constructing the VXLAN specification.
 - DSCP 统计只输出 `matched` 和 `changed`。
 - 重复 reconcile 不产生 attach churn、配置重复写入或孤立状态。
 - gateway 的周期 heal 只检查 VXLAN 设备和 DSCP attachment；业务配置从 SQLite hydrate、native datapath reconcile 和 DSCP map 更新只在启动、配置版本变化或 attachment 丢失后执行。
-- backend 的 xDS 长连接收到相同合并版本时只发送 ACK，不重复执行 VXLAN、FDB、策略路由、nft 和 native datapath apply；只有版本变化或首次收到版本时才应用配置。
+- backend 的 xDS 长连接收到相同合并版本时只发送 ACK，不重复执行 VXLAN、FDB、
+  policy-route、Redirect attach 或 map publish；只有版本变化或首次收到版本时才应用配置。
 - backend 已应用版本与该次冲突观测必须一起缓存、提交；同版本 ACK 重发该观测，不得用空列表伪装已无冲突。
 - gateway 仅完整 ACK（ack=true 且 version/response_nonce 非空）可以用空 conflicts 清除旧告警；不带版本/nonce 的心跳和空冲突 NACK 不代表新的健康观测。
 - backend 订阅与其 overlay 分配索引在同一个注册表锁内更新。断线清理必须匹配当前 stream_id，旧连接的退出或 ACK 不得修改新连接；TTL 清理同步删除两个索引，防止并发重连时遗留孤立节点。

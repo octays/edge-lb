@@ -2,9 +2,13 @@
 
 use std::{ffi::CString, mem::size_of};
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::Result;
 
-use crate::config::{Config, GatewayReturnPath};
+use crate::config::Config;
+#[cfg(test)]
+use crate::config::GatewayReturnPath;
 
 mod transport;
 
@@ -100,6 +104,7 @@ struct NfGenMsg {
     res_id: u16,
 }
 
+#[cfg(test)]
 pub fn apply_return_path(cfg: &Config) -> Result<()> {
     cfg.validate_backend_return_paths()?;
     let mut msg = Message::new();
@@ -195,10 +200,12 @@ pub(super) fn create_probe_table(table: &str) -> Result<()> {
     message.send()
 }
 
+#[cfg(test)]
 pub fn delete_table(cfg: &Config) -> Result<()> {
     delete_named_table(&cfg.backend_cfg().nft_table)
 }
 
+#[cfg(test)]
 pub fn delete_named_table(table: &str) -> Result<()> {
     let mut msg = Message::new();
     let mut seq = 0;
@@ -256,20 +263,24 @@ fn table_name_body_named(table: &str) -> Vec<u8> {
     body
 }
 
+#[cfg(test)]
 fn table_create_body(cfg: &Config) -> Vec<u8> {
     table_create_body_named(&cfg.backend_cfg().nft_table)
 }
 
+#[cfg(test)]
 fn table_create_body_named(table: &str) -> Vec<u8> {
     let mut body = table_name_body_named(table);
     push_u32(&mut body, NFTA_TABLE_FLAGS, 0);
     body
 }
 
+#[cfg(test)]
 fn chain_body(cfg: &Config, chain: BaseChain) -> Vec<u8> {
     chain_body_in_table(&cfg.backend_cfg().nft_table, chain)
 }
 
+#[cfg(test)]
 fn chain_body_in_table(table: &str, chain: BaseChain) -> Vec<u8> {
     let mut body = Vec::new();
     push_str(&mut body, NFTA_CHAIN_TABLE, table);
@@ -283,10 +294,12 @@ fn chain_body_in_table(table: &str, chain: BaseChain) -> Vec<u8> {
     body
 }
 
+#[cfg(test)]
 fn rule_body(cfg: &Config, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> {
     rule_body_in_table(&cfg.backend_cfg().nft_table, chain, exprs)
 }
 
+#[cfg(test)]
 fn rule_body_in_table(table: &str, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> {
     let mut body = Vec::new();
     push_str(&mut body, NFTA_RULE_TABLE, table);
@@ -299,12 +312,14 @@ fn rule_body_in_table(table: &str, chain: &str, exprs: Vec<Vec<u8>>) -> Vec<u8> 
     body
 }
 
+#[cfg(test)]
 fn forward_mark_exprs(_cfg: &Config, path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
     let mut expressions = ingress_match_exprs(path)?;
     expressions.extend([counter(), immediate_mark(path.mark), ct_set(NFT_CT_MARK)]);
     Ok(expressions)
 }
 
+#[cfg(test)]
 fn ingress_match_exprs(path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
     let dscp = path.dscp;
     // Out-of-range dscp used to be truncated to a DSCP-0 match here, which
@@ -323,6 +338,7 @@ fn ingress_match_exprs(path: &GatewayReturnPath) -> Result<Vec<Vec<u8>>> {
     ])
 }
 
+#[cfg(test)]
 fn reply_mark_exprs(mark: u32) -> Vec<Vec<u8>> {
     vec![
         ct_load(NFT_CT_MARK),
@@ -335,6 +351,7 @@ fn reply_mark_exprs(mark: u32) -> Vec<Vec<u8>> {
     ]
 }
 
+#[cfg(test)]
 fn return_marks(cfg: &Config) -> Vec<u32> {
     let mut marks = cfg
         .backend_return_paths()
@@ -346,6 +363,7 @@ fn return_marks(cfg: &Config) -> Vec<u32> {
     marks
 }
 
+#[cfg(test)]
 fn mss_clamp_exprs(cfg: &Config) -> Vec<Vec<u8>> {
     vec![
         meta_load(NFT_META_OIFNAME),
@@ -361,6 +379,7 @@ fn mss_clamp_exprs(cfg: &Config) -> Vec<Vec<u8>> {
     ]
 }
 
+#[cfg(test)]
 fn expr(name: &str, build: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     let mut body = Vec::new();
     push_str(&mut body, NFTA_EXPR_NAME, name);
@@ -368,6 +387,7 @@ fn expr(name: &str, build: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     body
 }
 
+#[cfg(test)]
 fn meta_load(key: u32) -> Vec<u8> {
     expr("meta", |data| {
         push_u32(data, NFTA_META_DREG, NFT_REG_1);
@@ -375,6 +395,7 @@ fn meta_load(key: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn meta_set(key: u32) -> Vec<u8> {
     expr("meta", |data| {
         push_u32(data, NFTA_META_SREG, NFT_REG_1);
@@ -382,6 +403,7 @@ fn meta_set(key: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn ct_load(key: u32) -> Vec<u8> {
     expr("ct", |data| {
         push_u32(data, NFTA_CT_DREG, NFT_REG_1);
@@ -389,6 +411,7 @@ fn ct_load(key: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn ct_set(key: u32) -> Vec<u8> {
     expr("ct", |data| {
         push_u32(data, NFTA_CT_SREG, NFT_REG_1);
@@ -396,6 +419,7 @@ fn ct_set(key: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn payload_load(base: u32, offset: u32, len: u32) -> Vec<u8> {
     expr("payload", |data| {
         push_u32(data, NFTA_PAYLOAD_DREG, NFT_REG_1);
@@ -405,6 +429,7 @@ fn payload_load(base: u32, offset: u32, len: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn bitwise_and(len: u32, mask: &[u8]) -> Vec<u8> {
     expr("bitwise", |data| {
         push_u32(data, NFTA_BITWISE_SREG, NFT_REG_1);
@@ -416,14 +441,17 @@ fn bitwise_and(len: u32, mask: &[u8]) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn cmp_u8(value: u8) -> Vec<u8> {
     cmp_bytes(&[value])
 }
 
+#[cfg(test)]
 fn cmp_mark(value: u32) -> Vec<u8> {
     cmp_bytes(&mark_register_bytes(value))
 }
 
+#[cfg(test)]
 fn cmp_bytes(value: &[u8]) -> Vec<u8> {
     expr("cmp", |data| {
         push_u32(data, NFTA_CMP_SREG, NFT_REG_1);
@@ -432,10 +460,12 @@ fn cmp_bytes(value: &[u8]) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn immediate_mark(value: u32) -> Vec<u8> {
     immediate_bytes(&mark_register_bytes(value))
 }
 
+#[cfg(test)]
 fn immediate_bytes(value: &[u8]) -> Vec<u8> {
     expr("immediate", |data| {
         push_u32(data, NFTA_IMMEDIATE_DREG, NFT_REG_1);
@@ -443,16 +473,19 @@ fn immediate_bytes(value: &[u8]) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn mark_register_bytes(value: u32) -> [u8; 4] {
     // nf_tables register data follows the host representation for packet
     // marks. Netlink attributes still use big-endian helpers above.
     value.to_ne_bytes()
 }
 
+#[cfg(test)]
 fn counter() -> Vec<u8> {
     expr("counter", |_| {})
 }
 
+#[cfg(test)]
 fn exthdr_tcpopt_write(kind: u8, offset: u32, len: u32) -> Vec<u8> {
     expr("exthdr", |data| {
         push_u32(data, NFTA_EXTHDR_SREG, NFT_REG_1);
@@ -463,12 +496,14 @@ fn exthdr_tcpopt_write(kind: u8, offset: u32, len: u32) -> Vec<u8> {
     })
 }
 
+#[cfg(test)]
 fn push_data(out: &mut Vec<u8>, typ: u16, value: &[u8]) {
     push_nested(out, typ, |data| {
         push_raw_attr(data, NFTA_DATA_VALUE, value);
     });
 }
 
+#[cfg(test)]
 fn ifname_bytes(name: &str) -> [u8; 16] {
     let mut bytes = [0_u8; 16];
     let raw = name.as_bytes();

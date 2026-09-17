@@ -52,9 +52,14 @@ pub fn delete_ingress_pref_best_effort(dev: &str, pref: u16) {
     imp::delete_pref(dev, Direction::Ingress, pref).ok();
 }
 
+pub fn delete_egress_pref_best_effort(dev: &str, pref: u16) {
+    imp::delete_pref(dev, Direction::Egress, pref).ok();
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Direction {
     Ingress,
+    Egress,
 }
 
 #[cfg(target_os = "linux")]
@@ -94,6 +99,7 @@ mod imp {
     const TC_H_INGRESS: u32 = 0xffff_fff1;
     const TC_H_UNSPEC: u32 = 0;
     const TC_H_MIN_INGRESS: u32 = 0xfff2;
+    const TC_H_MIN_EGRESS: u32 = 0xfff3;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -479,6 +485,7 @@ mod imp {
     const fn tc_parent(direction: Direction) -> u32 {
         match direction {
             Direction::Ingress => tc_handler_make(TC_H_CLSACT, TC_H_MIN_INGRESS),
+            Direction::Egress => tc_handler_make(TC_H_CLSACT, TC_H_MIN_EGRESS),
         }
     }
 
