@@ -300,6 +300,21 @@ fn restore_from_path(cfg: &Config, path: &Path) -> Result<RestoreSummary> {
     }
     let listener_index = ListenerRestoreIndex::new(&listeners)?;
     let elapsed_ns = unix_elapsed_ns(snapshot.saved_at_unix_ns, unix_now_ns());
+    let (mut summary, restore_entries) =
+        restore_entries_from_snapshot(&snapshot, &listener_index, elapsed_ns);
+    for chunk in restore_entries.chunks(RESTORE_BATCH_SIZE) {
+        native_dnat::upsert_flows(&runtime_cfg, chunk)?;
+    }
+    native_dnat::sweep_flows_and_refresh_loads(&runtime_cfg)?;
+    summary.duration = started.elapsed();
+    Ok(summary)
+}
+
+fn restore_entries_from_snapshot(
+    snapshot: &Snapshot,
+    listener_index: &ListenerRestoreIndex<'_>,
+    elapsed_ns: u64,
+) -> (RestoreSummary, Vec<(NativeFlowKey, NativeFlowValue)>) {
     let pairs = collect_restore_pairs(&snapshot.entries);
     let mut summary = RestoreSummary::default();
     let mut restore_entries = Vec::new();
@@ -324,12 +339,7 @@ fn restore_from_path(cfg: &Config, path: &Path) -> Result<RestoreSummary> {
         restore_entries.push((reverse_key, value));
         summary.restored_pairs += 1;
     }
-    for chunk in restore_entries.chunks(RESTORE_BATCH_SIZE) {
-        native_dnat::upsert_flows(&runtime_cfg, chunk)?;
-    }
-    native_dnat::sweep_flows_and_refresh_loads(&runtime_cfg)?;
-    summary.duration = started.elapsed();
-    Ok(summary)
+    (summary, restore_entries)
 }
 
 fn settings(cfg: &Config) -> GatewayFlowPersistenceConfig {
@@ -853,6 +863,43 @@ mod tests {
         (key, value)
     }
 
+    fn snapshot_with_pair(key: NativeFlowKey, value: NativeFlowValue) -> Snapshot {
+        let reverse = key.reverse_for(value);
+        Snapshot {
+            saved_at_unix_ns: 1_000,
+            node_name: "gateway-a".to_string(),
+            config_digest: [9; 32],
+            entries: vec![
+                SnapshotEntry {
+                    key,
+                    value,
+                    last_seen_age_ns: 10,
+                },
+                SnapshotEntry {
+                    key: reverse,
+                    value,
+                    last_seen_age_ns: 10,
+                },
+            ],
+        }
+    }
+
+    fn sip_listener(targets: Vec<NativeTarget>) -> NativeListener {
+        NativeListener {
+            name: "sip".to_string(),
+            target_group: "sip-targets".to_string(),
+            key: NativeListenerKey {
+                vip_ip: Ipv4Addr::new(192, 0, 2, 10),
+                vip_port: 5060,
+                protocol: NativeProtocol::Udp,
+            },
+            select: 0,
+            inactive_timeout_secs: 240,
+            dscp: 46,
+            targets,
+        }
+    }
+
     #[test]
     fn snapshot_round_trip_preserves_age_not_monotonic_time() {
         let (key, value) = flow_entry(40000, 90);
@@ -1082,5 +1129,41 @@ mod tests {
         let remapped = remap_value(value, 10, forward, &listeners).unwrap();
         assert_eq!(remapped.listener_id, 7);
         assert_eq!(remapped.target_id, 0);
+    }
+
+    #[test]
+    fn restore_skips_deleted_listener_as_config_mismatch() {
+        let (forward, value) = flow_entry(40000, 90);
+        let snapshot = snapshot_with_pair(forward, value);
+        let listeners = ListenerRestoreIndex::new(&[]).unwrap();
+
+        let (summary, entries) = restore_entries_from_snapshot(&snapshot, &listeners, 0);
+
+        assert!(entries.is_empty());
+        assert_eq!(summary.restored_pairs, 0);
+        assert_eq!(summary.skipped_config, 1);
+        assert_eq!(summary.skipped_expired, 0);
+        assert_eq!(summary.skipped_incomplete, 0);
+    }
+
+    #[test]
+    fn restore_skips_deleted_target_as_config_mismatch() {
+        let (forward, value) = flow_entry(40000, 90);
+        let snapshot = snapshot_with_pair(forward, value);
+        let listeners_data = vec![sip_listener(vec![NativeTarget {
+            address: Ipv4Addr::new(192, 0, 2, 21),
+            port: 5060,
+            weight: 1,
+            state: Default::default(),
+        }])];
+        let listeners = ListenerRestoreIndex::new(&listeners_data).unwrap();
+
+        let (summary, entries) = restore_entries_from_snapshot(&snapshot, &listeners, 0);
+
+        assert!(entries.is_empty());
+        assert_eq!(summary.restored_pairs, 0);
+        assert_eq!(summary.skipped_config, 1);
+        assert_eq!(summary.skipped_expired, 0);
+        assert_eq!(summary.skipped_incomplete, 0);
     }
 }
