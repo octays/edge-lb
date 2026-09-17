@@ -71,8 +71,7 @@ pub(super) fn refresh(context: &RedirectContext, events: &RouteEvents) -> Result
         &returns,
         &locals,
         monotonic_ns()?,
-    )?;
-    Ok(true)
+    )
 }
 
 pub(super) fn monotonic_ns() -> Result<u64> {
