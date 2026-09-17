@@ -512,10 +512,11 @@ was a short switchover-window miss rather than a persistent datapath failure.
   8-way concurrency. Some HA pressure failures may therefore include backend
   service or backend network-path jitter.
 - The `patch` branch now commits local HA role state only after the local
-  promote/demote hook or L2 VIP action succeeds. Final two-node failover
-  validation should still check `/api/v1/ha/status` and the node address list;
-  lost peer confirmations, late operations, and real fault injection remain
-  separate validation items.
+  promote/demote hook or L2 VIP action succeeds, and restores the local role if
+  peer handoff fails after local demotion. Final two-node failover validation
+  should still check `/api/v1/ha/status` and the node address list; lost peer
+  confirmations, late operations, and real fault injection remain separate
+  validation items.
 - The first shell script used a seconds+nanoseconds integer timestamp. On the
   load generator this caused Bash arithmetic edge cases and misleading average
   latency. The script now computes millisecond timestamps with explicit base-10

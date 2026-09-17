@@ -36,7 +36,7 @@
 | H1 | P0，部分已修 | xSync 跨机时间域和同批 delete/upsert 顺序已修；重连基线、世代和 ACK 语义仍不完整 | provider/native/xsync.rs | 中高，需协议与实机测试 |
 | S1 | P0 | 本地业务快照/CAS/整批事务与持久化待复制游标已落地（§20、§22） | handlers/listeners.rs、storage/proxy_config.rs、storage/repository.rs | 非集群事务；数据面通知仍有崩溃边界 |
 | H2 | P0 | 已实现快照序号、配对/角色 CAS、重放拒绝与后台重试；仲裁任期、晋升追平、客户端 op_id 和 UI 待做（§22） | storage/proxy_replication.rs、runtime/proxy_replication.rs | 后端核心已实施，尚不满足部署验收 |
-| H3 | P0，部分已修 | 手动/peer 切换已改为本机接管动作成功后才提交 active 状态；远端确认丢失、双机 fencing 与实机切换仍待验证 | native/ha.rs、handlers/ha.rs | 中高，需双机故障注入 |
+| H3 | P0，部分已修 | 手动/peer 切换已改为本机接管动作成功后才提交 active 状态；peer handoff 失败会回滚本机角色；远端确认丢失、双机 fencing 与实机切换仍待验证 | native/ha.rs、handlers/ha.rs | 中高，需双机故障注入 |
 | D3 | P1；分片业务发布前阻断 | 报文解析缺少明确分片/ICMP 差错契约 | eBPF/main.rs | 中高，不能静默误解析 |
 | C1 | P1，核心已修 | 订阅/overlay 原子更新、完整 ACK 清空及同版本 ACK 观测缓存已完成 | control/registry.rs、backend.rs | 第 18 节；线上重连验收待做 |
 | U1 | P1，部分已修 | 目标组保存失败不再关闭弹窗；请求响应乱序仍待处理 | useNodeData.ts、TargetGroupsPage.vue | 第 18 节 |
@@ -395,7 +395,7 @@ backend-server 的 TCP 每连接线程、串行 UDP 接收可能先达到瓶颈�
 | A：固定合同与复现 | [x] R1 外来路由/规则保护（§19 边界）；[x] C1 旧流退出/空 ACK；[x] U1 保存失败；[x] S1 并发写/回滚；[ ] H2 双机重放和 4 worker 场景 | 明确复现与回归证据，不把纯单测当真实网络验收 |
 | B：业务权威 | [x] 单一 SQLite mutation、跨资源事务、CAS、最新快照待发送槽、复制序号/错误状态；[ ] 客户端 op_id、仲裁任期、晋升追平、UI accepted 状态 | 见 §22；双机真实鉴权/故障测试与部署门槛未完成 |
 | C：数据面基础 | [x] D1/D2 第一阶段：已有 flow 优先、分片拒绝、稳定 listener_id、pinned map 刷新；[ ] 双向 flow 事务/GC、完整无损发布、D3 报文边界、R2 有反馈 PMTU | 特权 map/报文测试通过，配置变化不破坏无关流 |
-| D：HA 完整性 | [ ] H1 时间域/顺序/基线；[x] H3 本机 hook/VIP 成功后提交 active 状态；[ ] H3 双机 fencing 边界；H4 执行重试与接管能力 | 不同 uptime、故障注入、旧操作晚到、map 世代切换通过 |
+| D：HA 完整性 | [ ] H1 时间域/顺序/基线；[x] H3 本机 hook/VIP 成功后提交 active 状态；[x] H3 peer handoff 失败后回滚本机角色；[ ] H3 双机 fencing 边界；H4 执行重试与接管能力 | 不同 uptime、故障注入、旧操作晚到、map 世代切换通过 |
 | E：有界后台任务 | [ ] 探测并发、单轮维护视图、通知重试队列、HTTP 复用、无变化零写入 | 有明确资源上限，无队头长期阻塞，语义不变 |
 | F：测后调优 | [ ] flow 续期节流/batch、调度预计算、nft set、UI 缓存/分包 | 同版本对照，给出真实收益与回归成本 |
 | G：发布 | [ ] 验证 CI 门禁、制品 ABI、角色安装、停止/重启、文档合同 | 可复现报告、版本与实际二进制一致 |
