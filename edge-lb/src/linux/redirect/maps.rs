@@ -76,15 +76,16 @@ pub(super) fn snapshot(pin: &Path) -> Result<(SnapshotToken, Vec<TargetCandidate
     let mut candidates = Vec::new();
     for entry in targets.iter() {
         let (key, target) = entry?;
-        if target.flags & 1 != 0 && target.weight > 0 {
-            if let Some(dscp) = dscps.get(&key.listener_id) {
-                candidates.push(TargetCandidate {
-                    key,
-                    target: target.address.into(),
-                    port: target.port,
-                    dscp: u8::try_from(*dscp)?,
-                });
-            }
+        if target.flags & 1 != 0
+            && target.weight > 0
+            && let Some(dscp) = dscps.get(&key.listener_id)
+        {
+            candidates.push(TargetCandidate {
+                key,
+                target: target.address.into(),
+                port: target.port,
+                dscp: u8::try_from(*dscp)?,
+            });
         }
     }
     Ok((token, candidates))

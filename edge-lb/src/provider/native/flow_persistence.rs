@@ -328,7 +328,7 @@ fn restore_entries_from_snapshot(
             summary.skipped_expired += 1;
             continue;
         }
-        let Some(value) = remap_value(pair.value, restored_age, pair.forward_key, &listener_index)
+        let Some(value) = remap_value(pair.value, restored_age, pair.forward_key, listener_index)
         else {
             summary.skipped_config += 1;
             continue;

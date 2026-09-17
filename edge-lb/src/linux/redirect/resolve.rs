@@ -110,15 +110,15 @@ pub(super) fn observe_route(
             LinkAttribute::IfName(name) => observation.device = Some(name.clone()),
             LinkAttribute::Mtu(mtu) => observation.mtu = Some(*mtu),
             LinkAttribute::Address(mac) => observation.source_mac = unicast_mac(mac),
-            LinkAttribute::LinkInfo(infos) => {
+            LinkAttribute::LinkInfo(infos)
                 // Preserve the existing kernel VXLAN path. Other virtual
                 // devices need their own forwarding/offload validation.
                 if infos.iter().any(|info| {
                     matches!(info, LinkInfo::Kind(kind) if *kind != rtnetlink::packet_route::link::InfoKind::Vxlan)
-                }) {
-                    observation.state = State::UnsupportedDevice;
-                    return observation;
-                }
+                }) =>
+            {
+                observation.state = State::UnsupportedDevice;
+                return observation;
             }
             _ => {}
         }
