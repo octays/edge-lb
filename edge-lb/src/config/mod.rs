@@ -397,18 +397,6 @@ impl Config {
     pub fn pin_dir(&self) -> PathBuf {
         PathBuf::from(DEFAULT_PIN_DIR)
     }
-
-    /// Overlay gateway address without prefix (next-hop for backend routes).
-    pub fn gateway_overlay_ip(&self) -> Result<IpAddr> {
-        let gw = self.file.active_gateway()?;
-        let ip = gw
-            .overlay_ip
-            .split('/')
-            .next()
-            .unwrap_or(gw.overlay_ip.trim());
-        ip.parse()
-            .with_context(|| format!("bad gateway overlay_ip {}", gw.overlay_ip))
-    }
 }
 
 impl std::ops::Deref for Config {
