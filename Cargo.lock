@@ -595,7 +595,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "edge-lb"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "aya",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "edge-lb-common"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aya",
  "serde",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "edge-lb-ebpf"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aya-ebpf",
  "aya-ebpf-cty",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "ha-bench"
-version = "0.1.8"
+version = "0.1.9"
 
 [[package]]
 name = "hashbrown"

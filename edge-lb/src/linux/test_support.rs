@@ -5,6 +5,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+#[allow(dead_code)]
 mod network;
 pub(super) use network::*;
 pub(super) mod packet;
