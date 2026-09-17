@@ -10,6 +10,7 @@ mod network;
 pub(super) use network::*;
 pub(super) mod packet;
 pub(super) mod tc_packet;
+pub(super) mod xfrm;
 
 pub(super) fn private_namespace(mounts: bool) {
     let flags = libc::CLONE_NEWNET | if mounts { libc::CLONE_NEWNS } else { 0 };

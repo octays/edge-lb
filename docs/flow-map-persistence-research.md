@@ -19,8 +19,7 @@ flow pair。快照保存 `last_seen_age_ns` 或剩余 TTL，不保存本机 mono
 
 ## 当前基础
 
-- `NATIVE_FLOWS` 是 pinned eBPF LRU map，当前容量为 `1048576` entry。
-- 每条逻辑连接通常写正向和反向两条 entry，理想容量约 `524288` 对双向连接。
+- `NATIVE_FLOWS` 是 pinned eBPF LRU map，当前容量为 `1048576` entry；每条逻辑连接通常写正向和反向两条 entry，因此估算容量约 `524288` 个 canonical flow pair。
 - 用户态已有 `dump_flows`、`upsert_flows` 和 `delete_flows`，可以读取和写回 pinned map。
 - `sweep_flows_and_refresh_loads` 已能清理过期 flow，并从 flow map 重算 `lc` active flow。
 - xSync wire 层已经使用 `last_seen_age_ns`，接收端按本机 monotonic clock 还原
@@ -208,8 +207,8 @@ promotion 不依赖“VIP 地址是否刚刚绑定”这个副作用来触发 li
 4. [已实现] 增加启动 restore hook，放在 native datapath reconcile 之后。
 5. [已实现] 增加后台 snapshot worker，首版使用 30 秒 interval。
 6. [已实现] 补充 metrics 和日志。
-7. [部分实现] 单元测试已覆盖时间恢复、过期跳过、pair 不完整跳过和编码 round-trip；
-   target 重排 remap、配置删除跳过需要继续补充。
+7. [已实现] 单元测试已覆盖时间恢复、过期跳过、pair 不完整跳过、编码 round-trip、
+   target 重排 remap、listener 删除跳过和 target 删除跳过。
 8. [待验证] 在测试环境做回归：SIP/UDP 长会话、进程重启、eBPF 重挂、主机重启、HA 切换后再重启。
 
 ## 当前不建议做的事

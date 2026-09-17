@@ -280,7 +280,6 @@ pub struct TargetGroup {
     pub probe_port: Option<u16>,
     pub probe_req: Option<String>,
     pub probe_resp: Option<String>,
-    pub probe_status: Option<u16>,
     pub probe_skip_tls_verify: bool,
     pub period_secs: Option<u32>,
     pub retries: Option<u32>,

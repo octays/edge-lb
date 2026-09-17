@@ -45,7 +45,6 @@ type GroupForm = {
   probe_port: number | null
   probe_req: string
   probe_resp: string
-  probe_status: number | null
   probe_skip_tls_verify: boolean
   period_secs: number | null
   retries: number | null
@@ -57,7 +56,7 @@ const editingGroup = ref<string | null>(null)
 const groupError = ref('')
 const groupForm = reactive<GroupForm>({
   name: '', monitor: false, probe_type: 'tcp', probe_port: null, probe_req: '', probe_resp: '',
-  probe_status: null, probe_skip_tls_verify: false, period_secs: 15, retries: 3,
+  probe_skip_tls_verify: false, period_secs: 15, retries: 3,
   targets: [{ address: '', weight: 1 }],
 })
 const groupImportInput = ref<HTMLInputElement | null>(null)
@@ -107,7 +106,7 @@ function resetGroupForm(group?: TargetGroup) {
   Object.assign(groupForm, {
     name: group?.name ?? '', monitor: group?.monitor ?? false, probe_type: group?.probe_type ?? 'tcp',
     probe_port: group?.probe_port ?? null, probe_req: group?.probe_req ?? '', probe_resp: group?.probe_resp ?? '',
-    probe_status: group?.probe_status ?? null, probe_skip_tls_verify: group?.probe_skip_tls_verify ?? false,
+    probe_skip_tls_verify: group?.probe_skip_tls_verify ?? false,
     period_secs: group?.period_secs ?? 15, retries: group?.retries ?? 3,
     targets: group?.targets?.length ? group.targets.map((item) => ({ address: targetAddress(item), weight: item.weight })) : [{ address: '', weight: 1 }],
   })
@@ -146,9 +145,6 @@ async function saveGroup() {
   if (groupForm.monitor && groupForm.probe_type !== 'ping' && groupForm.probe_port !== null && (!Number.isInteger(groupForm.probe_port) || groupForm.probe_port < 1 || groupForm.probe_port > 65535)) {
     groupError.value = text('probePortRange'); return
   }
-  if (groupForm.monitor && groupForm.probe_status !== null && (!Number.isInteger(groupForm.probe_status) || groupForm.probe_status < 100 || groupForm.probe_status > 599)) {
-    groupError.value = text('expectedStatusRange'); return
-  }
   if (groupForm.monitor && (!groupForm.period_secs || groupForm.period_secs < 1 || groupForm.period_secs > 65535)) {
     groupError.value = text('periodRange'); return
   }
@@ -158,7 +154,7 @@ async function saveGroup() {
   const payload: TargetGroup = {
     name, monitor: groupForm.monitor, probe_type: groupForm.monitor ? groupForm.probe_type : null,
     probe_port: groupForm.monitor ? groupForm.probe_port : null, probe_req: groupForm.monitor ? groupForm.probe_req || null : null,
-    probe_resp: groupForm.monitor ? groupForm.probe_resp || null : null, probe_status: groupForm.monitor ? groupForm.probe_status : null,
+    probe_resp: groupForm.monitor ? groupForm.probe_resp || null : null,
     probe_skip_tls_verify: groupForm.monitor && groupForm.probe_type === 'https' && groupForm.probe_skip_tls_verify,
     period_secs: groupForm.monitor ? groupForm.period_secs : null, retries: groupForm.monitor ? groupForm.retries : null,
     targets: items.map((item) => ({ address: item.address.trim(), weight: Number(item.weight) })),
@@ -321,10 +317,6 @@ watch(
                 <div class="w-[140px] max-w-full space-y-1.5">
                   <Label>{{ text('retries') }}</Label>
                   <Input v-model.number="groupForm.retries" class="w-full" type="number" min="0" max="65535" step="1" />
-                </div>
-                <div v-if="['http', 'https'].includes(groupForm.probe_type)" class="w-[140px] max-w-full space-y-1.5">
-                  <Label>{{ text('expectedStatus') }}</Label>
-                  <Input v-model.number="groupForm.probe_status" class="w-full" type="number" min="100" max="599" step="1" placeholder="200" />
                 </div>
                 <div v-if="groupForm.probe_type !== 'ping'" class="space-y-1.5 md:col-span-2">
                   <Label>{{ ['http', 'https'].includes(groupForm.probe_type) ? text('probePath') : text('probeRequest') }} <span v-if="['http', 'https'].includes(groupForm.probe_type)" class="text-destructive">*</span></Label>

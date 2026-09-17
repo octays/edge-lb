@@ -298,7 +298,6 @@ fn target_group_probe(group: &TargetGroup) -> Option<HealthProbeConfig> {
         probe_port: group.probe_port,
         probe_req: group.probe_req.clone(),
         probe_resp: group.probe_resp.clone(),
-        expected_status: group.probe_status,
         skip_tls_verify: group.probe_skip_tls_verify,
         probe_duration: group.period_secs,
         inactive_retries: group.retries,

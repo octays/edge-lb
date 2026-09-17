@@ -20,9 +20,16 @@
 - DNAT 必须使用目标组显式配置的业务地址；仅按 backend 名称引用且地址未指定时，
   才解析为该 backend 的 underlay IP。健康探测、健康状态身份和 native target 使用同一
   解析语义，不得自动用 backend overlay 替换业务地址。
-- backend 在所有 IPv4 ingress 的 conntrack original 方向按已订阅 DSCP 设置 ct mark，
-  不依赖 VXLAN ingress 设备、L4 协议、业务端口或 active gateway。reply 方向只恢复
-  当前有效 contract 的 routing fwmark，经 VXLAN 返回 gateway；不改写业务源 IP。
+- backend return path 的目标实现只有 Redirect，不引入 `return_engine` 配置项，也不
+  保留 nftables 与 Redirect 双模式兼容语义。当前已部署版本中的 nftables return path
+  只能作为迁移前事实记录，不能作为 `patch` 分支最终验收路径。运行时代码不得自动
+  删除旧 nftables table、policy rule、route table 或 `/etc/iproute2/rt_tables`
+  条目；如需从旧版本迁移，按迁移文档人工处理。
+- backend Redirect 必须只从已订阅 VXLAN/DSCP contract 和实际数据包学习回程归属；
+  不依赖 L4 业务端口下发或 active gateway 状态。reply 方向经 VXLAN 返回请求所属
+  gateway；不改写业务源 IP。
+- backend 收到配置不变的 xDS snapshot 只能 ACK 并保持现有 Redirect 程序和 map 状态；
+  不得触发 VXLAN、Redirect attach/map publish 或 policy-route churn。
 - DSCP 是受信网络内的回程分类标记，不是身份认证。直连流量若携带相同 DSCP，也会
   被分类；部署方必须隔离这些 codepoint，不能再声称“同 DSCP 直连一定不被接管”。
   contract DSCP 必须为 1..63，多个 gateway 的 DSCP、非零 mark 和路由表不能冲突。
@@ -50,6 +57,9 @@
   target group、native listener/target map、DSCP map 或 native flow map，
   也禁止触发完整 datapath reconcile。这样切主只改变 VIP 所有权，不制造 TC
   detach/attach 空窗，也不丢失 xSync 已同步的 flow state。
+- HA active 选择持久化和 VIP 巡检不得设置业务 `state_dirty`。已经存在的 listener/
+  target-group dirty 标记也不得被 HA 切换清除；真实配置、健康和拓扑变化仍按各自路径
+  收敛。晋升本身不能借启动恢复逻辑回填旧磁盘 flow snapshot。
 - HA VIP 接管方式只暴露 `l2` 和 `hook`。BGP 接管模式已从产品配置面移除，
   API/UI 不得继续提供 BGP 表单或 capability；历史/外部传入的 `bgp` provider
   在运行期归一化为 `hook`，不能产生“保存成功但没有执行器”的状态。
@@ -70,6 +80,141 @@
 - 后端只接收并执行 VXLAN/DSCP 回程数据面配置，不判断 active gateway，不保存
   gateway 的 HA 运行来源，也不接收 listener/target group/service port。
 - IPv4 forwarding 由 gateway 和 backend 启动时幂等开启：gateway 用于 DNAT 后转发，backend 用于容器、桥接地址或其他本地路由目标的回程转发；cleanup 不关闭这个主机级能力。
+
+## 1.1 代码分层与结构化设计
+
+网络观察、配置收敛及自动化测试夹具统一使用原生 Rust API、netlink、procfs 或 syscall，
+不得派生 `ip`、`bridge`、`tc`、`nft`、`mount` 或 shell 子进程；测试不是默认例外。
+不得用解析 CLI 字符串的适配器伪装原生 API。构建/部署命令和文档中的人工诊断示例
+不属于数据面运行依赖；验证工具和测试后端也应遵守同一探测约束。已明确约定的 HA
+hook 保留脚本进程边界。
+替换外部命令必须保持已确认语义并通过真实内核回归，不得借替换机会更改回程归属。
+本次已确认删除 UDP 二元组学习，统一以 conntrack/DSCP 回程，见业务地址修复文档。
+
+以下要求适用于新增功能和本轮性能优化，属于实现与 review 约束：
+
+| 层次 | 职责 | 边界 |
+|---|---|---|
+| 配置/领域模型 | 描述 listener、target group 和已确认的 return-path contract | 不通过临时字段或多种解释扩展业务语义 |
+| 内核观察/I/O | 结构化读取 route、link、neighbor、能力和状态 | 只读，不在查询过程中写 map、修复路由或隐式发送探测包 |
+| 解析/校验/决策 | 根据显式输入产生结果、拒绝原因和期望状态 | 纯函数不执行 netlink、文件、子进程或 BPF map I/O |
+| 资源收敛 | 将期望状态应用到 owned map/资源 | 明确写入顺序、失效、所有权与失败处理，不重新定义业务规则 |
+| eBPF 数据面 | 有界解析、map 查询、报文改写与转发 | 不引入用户态控制面职责；与慢路径共享同一 flow/健康/回程语义 |
+| role/CLI/API | 组织调用、生命周期管理、结果展示 | 保持入口薄，不把上述逻辑内联堆积在 handler 中 |
+
+```mermaid
+flowchart TD
+    ENTRY[role / CLI / API 编排] --> OBS[内核观察 I/O]
+    OBS --> SNAP[类型化观察结果]
+    CONFIG[配置 / 领域模型] --> DECIDE[纯解析 / 校验 / 期望状态计算]
+    SNAP --> DECIDE
+    DECIDE --> DESIRED[类型化决策与期望状态]
+    DESIRED --> RECONCILE[资源收敛]
+    RECONCILE --> MAP[owned BPF maps / 内核资源]
+    MAP --> BPF[eBPF 报文处理]
+    SNAP --> VIEW[只读诊断展示]
+```
+
+- 按职责和所有权拆分模块，对外提供小接口，内部模块默认私有；禁止循环依赖和越层调用
+  写资源。不得把后续 redirect 功能持续堆入 `native_dnat.rs`、role handler 或大型工具文件。
+- 拆分必须降低实际复杂度，不按固定行数机械拆文件，不为尚无需求的扩展引入框架或 trait。
+- 层间使用类型化结构和明确的状态/原因枚举；结构化数据使用解析器或既有库，不能通过
+  CLI 展示字符串推断 route、neighbor、资源所有权或操作成功。
+- “观察成功”“准入通过”“收敛成功”“redirect 已提交”“实际投递成功”必须区分。
+  单次目的地址路由观察不能隐式授权跳过策略，也不能直接升级成长期有效的转发缓存。
+- userspace/eBPF 共享 ABI 统一放在 `edge-lb-common`，内核报文解析与修改放在
+  `edge-lb-ebpf`。ABI、字节序、map 生命周期及迁移责任在对应层明确记录。
+- 纯规则用独立单元测试；netlink/map/verifier 使用相应集成测试；拓扑、HA 和性能使用
+  端到端验证。不能用纯函数测试代替真实转发验证，也不能使所有决策测试依赖特权环境。
+- 隔离拓扑若显式授权缓存发布，必须标明未覆盖完整生产主机准入，并断言测试设备仍按
+  生产规则拒绝；不得增加运行期开关或放宽准入只为让用例命中 redirect。
+- 跨层功能实现前先记录职责、依赖方向和错误语义，review 时检查上述边界；架构变化仍
+  遵守先同步确认的规则，不扩大到无关模块的重构。
+
+本轮优化统一在 `patch` 分支开发，不新增配置、环境变量、API 或编译 feature 来选择
+新旧转发实现。满足条件自动加速，不满足条件按明确语义自动回退；完整实现约定范围并
+通过功能、故障、HA 和性能验证后，才能合并 `master`。
+
+指标与可观测性服从性能优先原则：不得为了新增指标在 eBPF 包路径、健康探测循环、
+路由/邻居刷新、map 发布或业务 reconcile 路径额外扫描、排序、hash 大集合，或增加
+新的系统调用/网络调用。允许暴露已经维护的计数器、固定容量 per-CPU stats、配置提交
+时已经生成的摘要和低频 `/proc` 资源读数；若一个指标需要新增计算成本或锁竞争，默认
+不加，先保留日志/离线诊断或单独提交方案确认。
+
+当前 route 观察实现采用 `linux/redirect/`：`model.rs` 定义观察结果，`netlink.rs` 负责
+有超时限制的只读采集，`resolve.rs` 负责纯解析和校验，`mod.rs` 暴露小接口，
+`tests.rs` 验证规则与内核查询。后续新增 planner/reconcile 或 eBPF helper 时按实际职责
+扩展，不把诊断结果直接当作 map 写入授权。
+
+正向 redirect 缓存的安全收敛分层如下：
+
+- `policy.rs` 纯检查 IPv4 rule 快照，当前只接受标准 local/main/default 查表规则；
+  未知属性、选择条件或修改过的优先级明确拒绝。此检查只证明 routing-rule 子条件，
+  不代表 TC/netfilter、安全策略或整个 fast path 准入通过。
+- 观察同时检查 `RTM_F_FIB_MATCH` 结果，避免普通 route lookup 将 ECMP 折叠成一个
+  next-hop 后误认为全体客户端可以共用它。读失败不切换为更宽松的查询方式。
+- `maps.rs` 独立拥有 route 缓存失效与发布。listener/target 配置或健康 map 更新之前，
+  先清空 redirect 缓存；清理失败必须向上传播，不能继续变更目标或声称已回退。
+- `events.rs` 只读取 route/link/neighbor/address/rule/TC/netconf、nft 和 XFRM 通知；
+  `worker.rs` 组织订阅、失效、刷新及错误重试，不读取 SQLite，不触发业务 reconcile 或 HA 切换。
+  建立/重建订阅、收到通知、接收失败、退出时使缓存失效。
+- `kernel_policy.rs` 观察原生 netfilter/XFRM 状态；`admission.rs` 组合主机与 TC 准入；
+  `planner.rs` 纯构造短租约期望条目；`reconcile.rs` 编排观察、准入、版本核验及发布。
+- 通知传播和 map 清理不是与内核变更原子提交；短有效期只限制陈旧窗口，不提供
+  零窗口保证。发布前检查待处理通知和 writer revision；通知检查后发生的内核变化
+  仍有异步窗口。不得以人工填表测试代替自动准入及端到端拓扑验证。
+
+缓存发布采用以下约束，不新增用户开关：
+
+- 内核安全观察通过原生 netlink 和 procfs 完成，不增加运行时 nft/ip 子进程依赖。
+  初始准入范围保守：有 nft table、legacy table、XFRM policy 或非 ACCEPT 的 XFRM
+  默认策略均拒绝；查询失败同样拒绝，不替用户删除或修改任何策略。
+- 路由、nft、XFRM 变更均使缓存失效。只查 XFRM policy 列表不够，空列表不代表
+  默认策略允许转发。legacy/sysctl 的无通知变化依赖定期重新观察和短有效期，必须
+  明确陈旧窗口，不能声称通知提供零窗口安全保证。
+- 缓存发布必须持有进程内唯一 writer 锁，验证观察开始时的 revision 和当前 pinned
+  map 身份。业务 map 的配置/健康修改持有同一锁直到修改结束，开始修改先推进
+  revision 并失效缓存；不得只在清空缓存时持锁，随后释放锁修改目标。
+- 内核通知使 revision 递增，即使缓存已经为空也递增；重连、查询错误和发布失败
+  都不能把之前取得的快照重新变成有效快照。新对象不得复用旧 map 的发布令牌。
+- 租约从观察开始计时，而非从耗时查询完成时重新计时。失效、过期或发布失败只
+  影响加速缓存，不改变已有 NAT 会话、后端选择、backend xDS 或 HA 所有权。
+- 当前租约为 2 秒，刷新间隔门槛为 500ms；不是硬实时调度。仅 REACHABLE/PERMANENT
+  邻居可续租，STALE/DELAY/PROBE 退回内核，不能持续续租而阻止 NUD 刷新。
+- 入口必须是启用的普通 Ethernet 设备；桥接/VRF 从属入口或出口不准入。源地址/TOS
+  FIB 条目、非标准 rule、非零 rp_filter、关闭 forwarding、无法证明的 LSM 或 TC 依赖
+  都回退；不改主机安全策略以强行获得加速。
+- 入口 TC 校验实际程序 map ID、priority、协议及 direct-action，不能只按程序名信任。
+  内核 dump 中的 handle-zero 分类器摘要不当作额外程序，但外来摘要/filter 不可忽略。
+  TCX 用 BPF query 单独检查，不依赖传统 TC dump；TCX 的无通知变化同样受短租约约束。
+- `NATIVE_LOCAL_ADDRS` 保存当前及该对象生命周期内曾使用的本机 IPv4 地址/广播地址，
+  用于拒绝把本地源地址包直接转发；4096 项满时发布失败并失效 route cache，不能漏检。
+  删除地址不立即删除保护条目，避免已取旧 route 的包与更新竞态。该 map 不参与会话持久化。
+- skb helper 读写与直接报文指针访问的边界必须区分：普通非线性 payload 不等于 GSO。
+  正向 redirect 使用 helper 只修改头部，不为准入主动拉平整包；GSO 仍回退，开始修改
+  TTL/L2 后的失败必须丢弃，不能把部分修改的报文交回普通转发路径。
+
+NAT 报文改写边界：
+
+- `edge-lb-ebpf/src/nat.rs` 统一拥有正向新流、已有流及回程的地址/端口、IPv4/L4
+  checksum 和 UDP zero-checksum 恢复；入口只负责解析、flow 生命周期和调用顺序。
+- 改写前的解析失败仍可 `TC_ACT_PIPE`；一旦调用 NAT 改写，任一 store/checksum helper
+  失败均返回 `TC_ACT_SHOT`，每包累计一次现有 `checksum_error`，不累计 `rewritten`。
+  不通过通用 `?` 把改写失败转换成入口默认 `PIPE`。
+- 不因这项错误处理修改 flow 插入、双向刷新、expiry、事件、xSync 或持久化 ABI；
+  改写前已完成的 flow 更新不会在丢包时回滚。重传仍使用已有 flow 决策。
+- FIB 查询成功不等于回程策略准入。回程使用内部 `NATIVE_RETURN_LEASES` 短租约，key
+  为 overlay ingress ifindex、FIB 实际出口 ifindex 和 reverse NAT 后的本机源 IPv4。
+  不借用 backend 方向的 route cache 为客户端授权，不存客户端路由或 MAC，不加用户开关。
+- `return_admission.rs` 只读观察设备、IPv4 路由和邻居；`return_planner.rs` 纯构造租约；
+  `return_maps.rs` 在共同 cache writer 锁内读写。快照同时核验正向和回程 map ID，
+  通知/业务变更/启动/退出/发布失败清理双向缓存；租约同样从观察开始计时两秒。
+- FIB helper 按实际 overlay ifindex、VIP/client tuple、TOS 和主机序 IP 长度做完整查询，
+  不使用 DIRECT/OUTPUT/SKIP_NEIGH/SRC。回程只允许已验证的普通 Ethernet 出口；出口有
+  非 REACHABLE/PERMANENT IPv4 邻居时整体停止续租，避免 FIB 直接转发阻止内核 NUD。
+- 两个方向共享 `redirect_packet::transmit` 的 TTL、IPv4 checksum、L2 改写和错误丢弃，
+  各自保持独立统计。新对象的两个 TC 程序须在删除旧挂载/pin 前通过 verifier；不支持
+  helper 时保留旧对象并报错，不假装可以靠空租约绕过 verifier 不支持的问题。
 
 ## Backend VXLAN reachability
 
@@ -119,7 +264,7 @@ backend binding alive while constructing the VXLAN specification.
 - `ping`：ICMP 探测，不使用端口、发送内容或响应匹配。
 - `tcp`：建立 TCP 连接；可选发送内容和响应子串匹配。未配置响应匹配时，连接成功即健康。
 - `udp`：发送可选内容；可选响应子串匹配。未配置响应匹配时，收到响应或在超时窗口内未收到 ICMP 不可达按当前 UDP 探测策略处理。
-- `http`：使用探测路径发起 HTTP GET；默认按 `2xx/3xx` 健康，可选指定 HTTP 状态码和响应匹配。
+- `http`：使用探测路径发起 HTTP GET；只有 `2xx/3xx` 状态码健康，可选响应匹配。
 - `https`：行为同 HTTP，可选跳过证书校验。
 
 字段语义：
@@ -127,7 +272,7 @@ backend binding alive while constructing the VXLAN specification.
 - `probe_port` 是健康探测端口，和监听的目标转发端口独立。
 - `probe_req` 对 TCP/UDP 表示发送内容，对 HTTP/HTTPS 表示探测路径。
 - `probe_resp` 表示响应内容子串匹配。
-- `probe_status` 只适用于 HTTP/HTTPS，范围为 `100..=599`。
+- HTTP/HTTPS 不提供可配置状态码字段，固定以 `200..=399` 为健康状态码范围。
 - `period_secs` 默认 15 秒，必须大于 0。
 - `retries` 默认 3 次，失败达到阈值后标记不健康；成功恢复立即标记健康。
 - 所有端口必须在 `1..=65535`；ping 不允许配置端口。
@@ -268,14 +413,15 @@ backend binding alive while constructing the VXLAN specification.
 涉及上述语义的修改至少覆盖：
 
 - TCP/UDP 无 payload、带发送内容、带响应匹配三种探测路径。
-- ping 不带端口，HTTP/HTTPS 状态码和 HTTPS 证书校验。
+- ping 不带端口，HTTP/HTTPS `200..=399` 状态码和 HTTPS 证书校验。
 - 监听 TCP+UDP 单对象保存、读取和数据面应用。
 - 目标组未绑定时不启动探测，绑定后能看到健康/不健康状态。
 - 目标组健康列只能统计健康、不健康、未关联监听三类；关联监听后不能展示 `unknown`。
 - DSCP 统计只输出 `matched` 和 `changed`。
 - 重复 reconcile 不产生 attach churn、配置重复写入或孤立状态。
 - gateway 的周期 heal 只检查 VXLAN 设备和 DSCP attachment；业务配置从 SQLite hydrate、native datapath reconcile 和 DSCP map 更新只在启动、配置版本变化或 attachment 丢失后执行。
-- backend 的 xDS 长连接收到相同合并版本时只发送 ACK，不重复执行 VXLAN、FDB、策略路由、nft 和 native datapath apply；只有版本变化或首次收到版本时才应用配置。
+- backend 的 xDS 长连接收到相同合并版本时只发送 ACK，不重复执行 VXLAN、FDB、
+  policy-route、Redirect attach 或 map publish；只有版本变化或首次收到版本时才应用配置。
 - backend 已应用版本与该次冲突观测必须一起缓存、提交；同版本 ACK 重发该观测，不得用空列表伪装已无冲突。
 - gateway 仅完整 ACK（ack=true 且 version/response_nonce 非空）可以用空 conflicts 清除旧告警；不带版本/nonce 的心跳和空冲突 NACK 不代表新的健康观测。
 - backend 订阅与其 overlay 分配索引在同一个注册表锁内更新。断线清理必须匹配当前 stream_id，旧连接的退出或 ACK 不得修改新连接；TTL 清理同步删除两个索引，防止并发重连时遗留孤立节点。
@@ -283,6 +429,8 @@ backend binding alive while constructing the VXLAN specification.
 - native 调度器支持 `rr`、`hash`、`consistent_hash`、`priority`、`persist` 和 `lc`：`rr` 只在健康目标 slot 间轮询，不做权重展开；`hash` 必须保留现有语义，使用内核 `bpf_get_hash_recalc(skb)` 的 skb hash 对目标 slot 取模，不得在原枚举上改成一致性 hash；`consistent_hash` 是独立策略，使用 edge-lb 自己定义的稳定流身份和用户态预计算的一致性桶表选择；`priority` 按目标权重做加权轮询；`persist` 按客户端地址保持；`lc` 按活动 flow 数选择并轮转平局。未知选择器回退到 RR。`n2/n3` 不属于纯 TCP/UDP DNAT 数据面。
 - `consistent_hash` 面向 SIP 等会话稳定场景。流身份只包含客户端 IPv4、客户端源端口、监听端口和协议，故意不包含 VIP；目标身份包含目标 IPv4 和目标端口。用户态按健康目标集合生成 1024 个 HRW/Rendezvous 一致性桶，bucket score 使用 64-bit 整数混合，eBPF 新流路径只计算流桶并查 `NATIVE_CHASH_BUCKETS`，然后二次校验 `NATIVE_TARGETS` 中目标仍 active/healthy。该策略只在 active/healthy 且未禁用的目标集合中选择，忽略权重数值；`weight = 0` 仍按不可选处理以兼容现有目标禁用语义。两台 gateway 只要配置、目标集合和健康观测一致，同一流身份必须选择同一 backend。目标增删或健康变化只允许导致一致性 hash 语义下的必要迁移。metrics 必须暴露实际 pinned bucket table 的 digest 以及 bucket hit/miss/unusable/fallback 计数，用于验证双 gateway 表一致和兜底路径是否异常。
 - native flow 命中任一方向时必须刷新正反两个 flow key 的 `last_seen_ns`，避免长连接单向活跃时另一方向提前过期；xSync 新建/删除走 ringbuf 事件，刷新状态通过低频差量 reconcile 同步，不做每包 refresh 事件。
+- `NATIVE_FLOWS` 容量按 eBPF entry 计数，不按业务连接计数；每条连接占用正向和反向两条 entry。当前 `NATIVE_FLOW_MAP_CAPACITY = 1048576`，约等于 `524288` 个 flow pair。继续放大到 `2097152` 或更高前必须先有压测目标、内存预算和 map 压力观测，不能把默认容量当作无成本调优项。
+- flow event ringbuf 写入失败必须计入 metrics；xSync 可以通过低频差量补偿恢复最终一致，但不能让事件丢失在高并发下静默发生。
 - native flow map 内部的 `last_seen_ns` 是本机 monotonic clock，只能在本机用于超时和新旧比较。xSync wire 层必须发送 `last_seen_age_ns`，接收端按本机 monotonic clock 还原 `last_seen_ns`；禁止跨 gateway 直接比较或复制绝对 monotonic 时间。
 - xSync 建立新的 gRPC session 并完成握手后，发送端必须清空本地 replica 索引并执行一次全量基线差量发送。接收端 ACK 的 `applied` 当前语义是“已被已挂载 datapath 接受的操作数”，幂等 no-op 也计数；发送端只有确认数等于本批发送操作数时才能推进 replica 索引。BACKUP native flow map 未挂载时不能把 0 变更误判为已同步。
 - xSync 单批最多发送 4096 个 flow 操作。达到上限时优先发送 upsert，delete 延后到后续补偿轮次；这样优先保证新建/活跃连接接管能力，同时限制单条 gRPC 消息和发送端内存峰值。

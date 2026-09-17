@@ -36,7 +36,7 @@
 | H1 | P0，部分已修 | xSync 跨机时间域和同批 delete/upsert 顺序已修；重连基线、世代和 ACK 语义仍不完整 | provider/native/xsync.rs | 中高，需协议与实机测试 |
 | S1 | P0 | 本地业务快照/CAS/整批事务与持久化待复制游标已落地（§20、§22） | handlers/listeners.rs、storage/proxy_config.rs、storage/repository.rs | 非集群事务；数据面通知仍有崩溃边界 |
 | H2 | P0 | 已实现快照序号、配对/角色 CAS、重放拒绝与后台重试；仲裁任期、晋升追平、客户端 op_id 和 UI 待做（§22） | storage/proxy_replication.rs、runtime/proxy_replication.rs | 后端核心已实施，尚不满足部署验收 |
-| H3 | P0 | 手动切换先升对端再降本端，响应丢失可能留下双主 | native/ha.rs、handlers/ha.rs | 高，需切换操作状态机 |
+| H3 | P0，部分已修 | 手动/peer 切换已改为本机接管动作成功后才提交 active 状态；peer handoff 失败会回滚本机角色；本机 takeover 失败会通知 peer 恢复原 active；远端确认丢失、双机 fencing 与实机切换仍待验证 | native/ha.rs、handlers/ha.rs | 中高，需双机故障注入 |
 | D3 | P1；分片业务发布前阻断 | 报文解析缺少明确分片/ICMP 差错契约 | eBPF/main.rs | 中高，不能静默误解析 |
 | C1 | P1，核心已修 | 订阅/overlay 原子更新、完整 ACK 清空及同版本 ACK 观测缓存已完成 | control/registry.rs、backend.rs | 第 18 节；线上重连验收待做 |
 | U1 | P1，部分已修 | 目标组保存失败不再关闭弹窗；请求响应乱序仍待处理 | useNodeData.ts、TargetGroupsPage.vue | 第 18 节 |
@@ -226,9 +226,9 @@ DSCP 端口 HashMap 已落地，接下来测 1/8/16 个端口、命中/不命中
 
 ### 8.1 切换状态机
 
-[源码] switch_active_gateway 切到对端时先请求 peer activate；对端写 active、绑 VIP、发 GARP，返回后本机才写 active 并解绑。[推导] 中间存在双端持有 VIP 的窗口；如果对端已执行但响应丢失，本机可能保持 MASTER。peer_activate 的 bind/GARP 失败也可能发生在 active 已提交之后。
+[源码] patch 分支的切换提交顺序已经收紧：切到对端时先在本机执行 BACKUP 角色、解绑 VIP，再通知对端升主；若对端激活失败，本机会尝试恢复本机 MASTER 角色。切到本机时先要求对端降级，对端 `peer_activate` 先执行本机角色变更，再提交 active 状态；若本机升主失败，会通知对端恢复原 active。[推导] 这消除了“角色动作失败但 active 已经提交”的本地时序问题，但仍没有形成完整的跨节点事务。
 
-计划：切换操作 ID/任期、准备与完成状态、超时查询确认、幂等续做；已提交 active 与实际绑定/宣告分别可观测。不得声称两个节点仅靠 BFD 就能在完全网络分区时同时保证“始终唯一主”和“始终自动可用”；严格唯一主需要租约/仲裁/外部 fencing 之类的独立证明，若不引入则必须明确故障边界。
+计划：切换操作 ID/任期、准备与完成状态、超时查询确认、幂等续做；已提交 active、实际绑定/宣告和回滚结果分别可观测。不得声称两个节点仅靠 BFD 就能在完全网络分区时同时保证“始终唯一主”和“始终自动可用”；严格唯一主需要租约/仲裁/外部 fencing 之类的独立证明，若不引入则必须明确故障边界。
 
 手动切换和 BFD 接管要走同一受保护执行入口，避免两个地方各自写 active 和操作 VIP。保持切换不重建业务 maps 的现有保护。
 
@@ -395,7 +395,7 @@ backend-server 的 TCP 每连接线程、串行 UDP 接收可能先达到瓶颈�
 | A：固定合同与复现 | [x] R1 外来路由/规则保护（§19 边界）；[x] C1 旧流退出/空 ACK；[x] U1 保存失败；[x] S1 并发写/回滚；[ ] H2 双机重放和 4 worker 场景 | 明确复现与回归证据，不把纯单测当真实网络验收 |
 | B：业务权威 | [x] 单一 SQLite mutation、跨资源事务、CAS、最新快照待发送槽、复制序号/错误状态；[ ] 客户端 op_id、仲裁任期、晋升追平、UI accepted 状态 | 见 §22；双机真实鉴权/故障测试与部署门槛未完成 |
 | C：数据面基础 | [x] D1/D2 第一阶段：已有 flow 优先、分片拒绝、稳定 listener_id、pinned map 刷新；[ ] 双向 flow 事务/GC、完整无损发布、D3 报文边界、R2 有反馈 PMTU | 特权 map/报文测试通过，配置变化不破坏无关流 |
-| D：HA 完整性 | [ ] H1 时间域/顺序/基线；H3 切换幂等/fencing 边界；H4 执行重试与接管能力 | 不同 uptime、故障注入、旧操作晚到、map 世代切换通过 |
+| D：HA 完整性 | [ ] H1 时间域/顺序/基线；[x] H3 本机 hook/VIP 成功后提交 active 状态；[x] H3 peer handoff 失败后回滚本机角色；[x] H3 本机 takeover 失败后通知 peer 回滚；[ ] H3 双机 fencing 边界；H4 执行重试与接管能力 | 不同 uptime、故障注入、旧操作晚到、map 世代切换通过 |
 | E：有界后台任务 | [ ] 探测并发、单轮维护视图、通知重试队列、HTTP 复用、无变化零写入 | 有明确资源上限，无队头长期阻塞，语义不变 |
 | F：测后调优 | [ ] flow 续期节流/batch、调度预计算、nft set、UI 缓存/分包 | 同版本对照，给出真实收益与回归成本 |
 | G：发布 | [ ] 验证 CI 门禁、制品 ABI、角色安装、停止/重启、文档合同 | 可复现报告、版本与实际二进制一致 |

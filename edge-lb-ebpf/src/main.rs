@@ -8,6 +8,12 @@
 #![no_std]
 #![no_main]
 
+mod backend_redirect;
+mod nat;
+mod redirect;
+mod redirect_packet;
+mod return_redirect;
+
 use aya_ebpf::{
     EbpfContext,
     bindings::{__sk_buff, TC_ACT_PIPE},
@@ -19,12 +25,12 @@ use aya_ebpf::{
 use aya_ebpf_cty::c_long;
 use edge_lb_common::{
     DEFAULT_DSCP, DSCP_PORT_MAP_CAPACITY, MAX_TARGETS_PER_LISTENER,
-    NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_LISTENER_ID_CAPACITY,
-    NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH, NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST,
-    NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR, NativeConsistentHashBucketKey,
-    NativeConsistentHashBucketValue, NativeFlowEvent, NativeFlowKey, NativeFlowValue,
-    NativeListenerLookupKey, NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey,
-    NativeTargetValue, Stats, native_consistent_flow_bucket,
+    NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY, NATIVE_FLOW_MAP_CAPACITY,
+    NATIVE_LISTENER_ID_CAPACITY, NATIVE_SELECT_CONSISTENT_HASH, NATIVE_SELECT_HASH,
+    NATIVE_SELECT_LC, NATIVE_SELECT_PERSIST, NATIVE_SELECT_PRIORITY, NATIVE_SELECT_RR,
+    NativeConsistentHashBucketKey, NativeConsistentHashBucketValue, NativeFlowEvent, NativeFlowKey,
+    NativeFlowValue, NativeListenerLookupKey, NativeListenerLookupValue, NativeTargetKey,
+    NativeTargetLoadKey, NativeTargetValue, Stats, native_consistent_flow_bucket,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -64,7 +70,7 @@ static NATIVE_ACTIVE_FLOWS: HashMap<NativeTargetLoadKey, u32> = HashMap::with_ma
 
 #[map]
 static NATIVE_FLOWS: LruHashMap<NativeFlowKey, NativeFlowValue> =
-    LruHashMap::with_max_entries(1048576, 0);
+    LruHashMap::with_max_entries(NATIVE_FLOW_MAP_CAPACITY, 0);
 
 #[map]
 static NATIVE_FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
@@ -78,6 +84,32 @@ unsafe fn bpf_get_hash_recalc(skb: *mut __sk_buff) -> u32 {
     let fun: unsafe extern "C" fn(skb: *mut __sk_buff) -> u32 =
         unsafe { core::mem::transmute(34usize) };
     unsafe { fun(skb) }
+}
+
+#[classifier]
+pub fn backend_return_ingress(ctx: TcContext) -> i32 {
+    match try_backend_return_ingress(ctx) {
+        Ok(action) => action,
+        Err(_) => TC_ACT_PIPE,
+    }
+}
+
+fn try_backend_return_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
+    let now = unsafe { bpf_ktime_get_ns() };
+    Ok(backend_redirect::ingress(&mut ctx, now))
+}
+
+#[classifier]
+pub fn backend_return_egress(ctx: TcContext) -> i32 {
+    match try_backend_return_egress(ctx) {
+        Ok(action) => action,
+        Err(_) => TC_ACT_PIPE,
+    }
+}
+
+fn try_backend_return_egress(mut ctx: TcContext) -> Result<i32, c_long> {
+    let now = unsafe { bpf_ktime_get_ns() };
+    Ok(backend_redirect::egress(&mut ctx, now))
 }
 
 #[classifier]
@@ -130,26 +162,30 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
             refreshed.last_seen_ns = now;
             let _ = NATIVE_FLOWS.insert(&flow_key, &refreshed, 0);
             let _ = NATIVE_FLOWS.insert(&reverse_key, &refreshed, 0);
-            rewrite_ipv4_destination(
-                &mut ctx,
-                ip_off,
-                l4_off,
-                l4_csum_off,
+            let rewrite = nat::Rewrite {
                 // The packet still carries the listener VIP. Reuse the
                 // cached backend selection for every packet in the flow, even
                 // when the listener map has changed since the flow was
                 // created.
-                existing.vip,
-                existing.target,
-                dport,
-                existing.target_port,
-            )?;
-            if preserve_zero_udp_checksum {
-                ctx.store(l4_csum_off, &0u16, 0)?;
+                old_address: existing.vip,
+                new_address: existing.target,
+                old_port: dport,
+                new_port: existing.target_port,
+                preserve_zero_udp_checksum,
+            };
+            if let Err(error) = rewrite.destination(&mut ctx, ip_off, l4_off, l4_csum_off) {
+                return Ok(error.action());
             }
             native_bump(|stats| stats.listener_hit += 1);
             native_bump(|stats| stats.rewritten += 1);
-            return Ok(TC_ACT_PIPE);
+            return Ok(redirect::forward(
+                &mut ctx,
+                NativeTargetKey {
+                    listener_id: existing.listener_id,
+                    target_id: existing.target_id,
+                },
+                now,
+            ));
         }
         let _ = NATIVE_FLOWS.remove(&flow_key);
         let _ = NATIVE_FLOWS.remove(&reverse_key);
@@ -219,35 +255,37 @@ fn try_native_dnat_ingress(mut ctx: TcContext) -> Result<i32, c_long> {
     adjust_active_flows(listener.listener_id, target_id, 1);
     emit_flow_event(flow_key, value, 1);
     emit_flow_event(reverse_key, value, 1);
-    rewrite_ipv4_destination(
-        &mut ctx,
-        ip_off,
-        l4_off,
-        l4_csum_off,
-        old_dst,
-        new_dst,
+    let rewrite = nat::Rewrite {
+        old_address: old_dst,
+        new_address: new_dst,
         old_port,
         new_port,
-    )?;
-    if preserve_zero_udp_checksum {
-        ctx.store(l4_csum_off, &0u16, 0)?;
+        preserve_zero_udp_checksum,
+    };
+    if let Err(error) = rewrite.destination(&mut ctx, ip_off, l4_off, l4_csum_off) {
+        return Ok(error.action());
     }
     native_bump(|stats| stats.listener_hit += 1);
     native_bump(|stats| stats.rewritten += 1);
-    Ok(TC_ACT_PIPE)
+    Ok(redirect::forward(&mut ctx, target_key, now))
 }
 
 #[inline(always)]
 fn emit_flow_event(key: NativeFlowKey, value: NativeFlowValue, op: u8) {
-    let _ = NATIVE_FLOW_EVENTS.output(
-        &NativeFlowEvent {
-            key,
-            value,
-            op,
-            _pad: [0; 7],
-        },
-        0,
-    );
+    if NATIVE_FLOW_EVENTS
+        .output(
+            &NativeFlowEvent {
+                key,
+                value,
+                op,
+                _pad: [0; 7],
+            },
+            0,
+        )
+        .is_err()
+    {
+        native_bump(|stats| stats.flow_event_lost += 1);
+    }
 }
 
 #[classifier]
@@ -318,21 +356,18 @@ fn try_native_dnat_return(mut ctx: TcContext) -> Result<i32, c_long> {
     let _ = NATIVE_FLOWS.insert(&key, &refreshed, 0);
     let forward_key = key.forward_for(flow);
     let _ = NATIVE_FLOWS.insert(&forward_key, &refreshed, 0);
-    rewrite_ipv4_source(
-        &mut ctx,
-        ip_off,
-        l4_off,
-        l4_csum_off,
-        flow.target,
-        flow.vip,
-        sport,
-        u16::from_be(flow.vip_port),
-    )?;
-    if preserve_zero_udp_checksum {
-        ctx.store(l4_csum_off, &0u16, 0)?;
+    let rewrite = nat::Rewrite {
+        old_address: flow.target,
+        new_address: flow.vip,
+        old_port: sport,
+        new_port: u16::from_be(flow.vip_port),
+        preserve_zero_udp_checksum,
+    };
+    if let Err(error) = rewrite.source(&mut ctx, ip_off, l4_off, l4_csum_off) {
+        return Ok(error.action());
     }
     native_bump(|stats| stats.rewritten += 1);
-    Ok(TC_ACT_PIPE)
+    Ok(return_redirect::forward(&mut ctx, now))
 }
 
 fn flow_key(ip: &Ipv4Hdr, sport: u16, dport: u16) -> NativeFlowKey {
@@ -621,68 +656,6 @@ fn adjust_active_flows(listener_id: u32, target_id: u32, delta: i32) {
     } else {
         let _ = NATIVE_ACTIVE_FLOWS.insert(&key, &next, 0);
     }
-}
-
-const BPF_F_PSEUDO_HDR: u64 = 1 << 4;
-
-fn rewrite_ipv4_destination(
-    ctx: &mut TcContext,
-    ip_off: usize,
-    l4_off: usize,
-    l4_csum_off: usize,
-    old_dst: u32,
-    new_dst: u32,
-    old_port: u16,
-    new_port: u16,
-) -> Result<(), c_long> {
-    let old_dst_be = old_dst.to_be();
-    let new_dst_be = new_dst.to_be();
-    ctx.store(ip_off + 16, &new_dst_be, 0)?;
-    ctx.l3_csum_replace(ip_off + 10, old_dst_be as u64, new_dst_be as u64, 4)?;
-    ctx.l4_csum_replace(
-        l4_csum_off,
-        old_dst_be as u64,
-        new_dst_be as u64,
-        4 | BPF_F_PSEUDO_HDR,
-    )?;
-    ctx.store(l4_off + 2, &new_port.to_be(), 0)?;
-    ctx.l4_csum_replace(
-        l4_csum_off,
-        old_port.to_be() as u64,
-        new_port.to_be() as u64,
-        2,
-    )?;
-    Ok(())
-}
-
-fn rewrite_ipv4_source(
-    ctx: &mut TcContext,
-    ip_off: usize,
-    l4_off: usize,
-    l4_csum_off: usize,
-    old_src: u32,
-    new_src: u32,
-    old_port: u16,
-    new_port: u16,
-) -> Result<(), c_long> {
-    let old_src_be = old_src.to_be();
-    let new_src_be = new_src.to_be();
-    ctx.store(ip_off + 12, &new_src_be, 0)?;
-    ctx.l3_csum_replace(ip_off + 10, old_src_be as u64, new_src_be as u64, 4)?;
-    ctx.l4_csum_replace(
-        l4_csum_off,
-        old_src_be as u64,
-        new_src_be as u64,
-        4 | BPF_F_PSEUDO_HDR,
-    )?;
-    ctx.store(l4_off, &new_port.to_be(), 0)?;
-    ctx.l4_csum_replace(
-        l4_csum_off,
-        old_port.to_be() as u64,
-        new_port.to_be() as u64,
-        2,
-    )?;
-    Ok(())
 }
 
 fn native_bump(update: impl FnOnce(&mut edge_lb_common::NativeDatapathStats)) {

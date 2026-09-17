@@ -1,5 +1,9 @@
 #![no_std]
 
+pub mod backend_redirect;
+pub mod redirect;
+pub mod return_redirect;
+
 #[cfg(feature = "user")]
 extern crate std;
 
@@ -28,7 +32,12 @@ pub const MAX_TARGETS_PER_LISTENER: u32 = 64;
 pub const NATIVE_CONSISTENT_HASH_BUCKETS: u32 = 1024;
 pub const NATIVE_CONSISTENT_HASH_BUCKET_MAP_CAPACITY: u32 = 262_144;
 pub const NATIVE_LISTENER_ID_CAPACITY: u32 = 4096;
+/// Native flow map entries. Each connection consumes two entries: forward and reverse.
+pub const NATIVE_FLOW_MAP_CAPACITY: u32 = 1_048_576;
+pub const NATIVE_FLOW_PAIR_CAPACITY: u32 = NATIVE_FLOW_MAP_CAPACITY / 2;
 pub const NATIVE_DNAT_INGRESS_PROGRAM: &str = "native_dnat_ingress";
+pub const NATIVE_LISTENERS_MAP: &str = "NATIVE_LISTENERS";
+pub const NATIVE_TARGETS_MAP: &str = "NATIVE_TARGETS";
 pub const NATIVE_DNAT_RETURN_PROGRAM: &str = "native_dnat_return";
 
 #[repr(C)]
@@ -229,6 +238,13 @@ pub fn native_consistent_bucket_score(bucket: u32, target: &NativeTargetValue) -
 #[cfg(test)]
 mod flow_key_tests {
     use super::*;
+
+    #[test]
+    fn native_flow_capacity_is_bidirectional_entry_capacity() {
+        assert_eq!(NATIVE_FLOW_MAP_CAPACITY, 1_048_576);
+        assert_eq!(NATIVE_FLOW_PAIR_CAPACITY, 524_288);
+        assert_eq!(NATIVE_FLOW_MAP_CAPACITY, NATIVE_FLOW_PAIR_CAPACITY * 2);
+    }
 
     #[test]
     fn flow_pair_retains_client_identity_in_both_directions() {
@@ -768,6 +784,7 @@ pub struct NativeDatapathStats {
     pub chash_bucket_miss: u64,
     pub chash_bucket_unusable: u64,
     pub chash_fallback: u64,
+    pub flow_event_lost: u64,
 }
 
 #[cfg(feature = "user")]

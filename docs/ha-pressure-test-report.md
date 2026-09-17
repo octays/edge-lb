@@ -511,11 +511,13 @@ was a short switchover-window miss rather than a persistent datapath failure.
 - A direct isolation run showed that `192.168.0.14:8080` can also timeout under
   8-way concurrency. Some HA pressure failures may therefore include backend
   service or backend network-path jitter.
-- The failover API currently may return before the target node has finished VIP
-  binding. A response with `vip_bound=false` does not necessarily mean final
-  failure. Final state should be checked through `/api/v1/ha/status` and the
-  node address list. This API should eventually return an async operation status
-  or wait for target-node confirmation.
+- The `patch` branch now commits local HA role state only after the local
+  promote/demote hook or L2 VIP action succeeds, and restores the local role if
+  peer handoff fails after local demotion. If local takeover fails after peer
+  demotion, it notifies the peer to restore the previous active gateway. Final
+  two-node failover validation should still check `/api/v1/ha/status` and the
+  node address list; lost peer confirmations, late operations, and real fault
+  injection remain separate validation items.
 - The first shell script used a seconds+nanoseconds integer timestamp. On the
   load generator this caused Bash arithmetic edge cases and misleading average
   latency. The script now computes millisecond timestamps with explicit base-10

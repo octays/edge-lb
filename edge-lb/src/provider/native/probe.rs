@@ -43,7 +43,6 @@ pub struct ProbeTarget {
     pub probe_type: String,
     pub probe_req: Option<String>,
     pub probe_resp: Option<String>,
-    pub expected_status: Option<u16>,
     pub skip_tls_verify: bool,
     pub timeout: Duration,
     pub period: Duration,
@@ -200,7 +199,6 @@ pub fn scheduled_targets(cfg: &Config) -> Vec<ProbeTarget> {
                 probe_type: probe_type.clone(),
                 probe_req: group.probe_req.clone(),
                 probe_resp: group.probe_resp.clone(),
-                expected_status: group.probe_status,
                 skip_tls_verify: group.probe_skip_tls_verify,
                 timeout,
                 period: Duration::from_secs(period_secs),
@@ -545,7 +543,7 @@ fn probe_http(target: &ProbeTarget, clients: &ProbeClients, tls: bool) -> ProbeO
     match client.get(&url).timeout(target.timeout).send() {
         Ok(mut response) => {
             let status = response.status().as_u16();
-            if http_status_is_healthy(status, target.expected_status) {
+            if http_status_is_healthy(status) {
                 // Consume a bounded body to validate matching and permit connection reuse.
                 use std::io::Read;
                 let mut body = Vec::new();
@@ -583,8 +581,8 @@ fn probe_http(target: &ProbeTarget, clients: &ProbeClients, tls: bool) -> ProbeO
     }
 }
 
-fn http_status_is_healthy(status: u16, expected: Option<u16>) -> bool {
-    expected.map_or((200..400).contains(&status), |value| value == status)
+fn http_status_is_healthy(status: u16) -> bool {
+    (200..400).contains(&status)
 }
 
 fn tcp_connect(address: IpAddr, port: u16, timeout: Duration) -> Result<TcpStream> {
@@ -678,7 +676,6 @@ mod tests {
             probe_type: kind.to_string(),
             probe_req: Some("health".to_string()),
             probe_resp: Some("healthy".to_string()),
-            expected_status: None,
             skip_tls_verify: false,
             timeout: Duration::from_millis(500),
             period: Duration::from_secs(15),
@@ -724,7 +721,6 @@ mod tests {
         let mut target = local_probe("http", server.local_addr().unwrap().port());
         target.timeout = Duration::from_secs(2);
         target.probe_req = Some("/health?full=1".to_string());
-        target.expected_status = Some(200);
         let thread = std::thread::spawn(move || {
             for body in ["healthy", "failure"] {
                 let (mut stream, _) = server.accept().unwrap();
@@ -795,7 +791,6 @@ mod tests {
             probe_port: None,
             probe_req: None,
             probe_resp: None,
-            probe_status: None,
             probe_skip_tls_verify: false,
             period_secs: Some(5),
             retries: Some(2),
@@ -940,16 +935,42 @@ mod tests {
     }
 
     #[test]
-    fn http_status_rule_accepts_success_redirects_by_default() {
-        assert!(http_status_is_healthy(200, None));
-        assert!(http_status_is_healthy(302, None));
-        assert!(!http_status_is_healthy(199, None));
-        assert!(!http_status_is_healthy(400, None));
+    fn http_status_rule_accepts_only_success_redirect_range() {
+        assert!(!http_status_is_healthy(199));
+        assert!(http_status_is_healthy(200));
+        assert!(http_status_is_healthy(204));
+        assert!(http_status_is_healthy(302));
+        assert!(http_status_is_healthy(399));
+        assert!(!http_status_is_healthy(400));
+        assert!(!http_status_is_healthy(500));
     }
 
     #[test]
-    fn http_status_rule_supports_exact_expected_status() {
-        assert!(http_status_is_healthy(204, Some(204)));
-        assert!(!http_status_is_healthy(200, Some(204)));
+    fn http_probe_accepts_any_success_redirect_status() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut target = local_probe("http", server.local_addr().unwrap().port());
+        target.timeout = Duration::from_secs(2);
+        target.probe_req = Some("/health".to_string());
+        target.probe_resp = None;
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(request.starts_with(b"GET /health HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let clients = ProbeClients::new();
+        assert_eq!(probe_http(&target, &clients, false), ProbeOutcome::Ok);
+        thread.join().unwrap();
     }
 }

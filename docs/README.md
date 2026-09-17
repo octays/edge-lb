@@ -17,7 +17,19 @@
   本次修复的隔离测试不代表线上已部署。
 - `ha-pressure-test-report.zh-CN.md` / `ha-pressure-test-report.md`：HA 和并发压测报告。
 - `forwarding-performance-options.md`：gateway 转发性能候选方案评估，比较当前 TC DNAT、
-  veth、TC redirect、XDP 和 AF_XDP 的收益边界与验证顺序。
+  TC direct redirect 和 XDP optional fast path 的收益边界与验证顺序。
+- `forwarding-optimization-implementation-plan.md`：`patch` 分支的 P0-P4 优先级、
+  阶段进展、验证记录与合并条件。
+- `patch-rollout-validation-2026-09-16.md`：本地重载回归、四机滚动部署摘要、旧版基线与
+  三轮新版稳态测试；记录切流 UDP 超时、采样配额问题修复及 rp_filter 导致快路径未准入，尚未完成优化验收。
+- `udp-return-ownership-diagnosis.md`：UDP 双归属的规则顺序、真实过期与显式源地址回归，
+  HA 多余 reconcile 修复，以及待确认的有限 UDP 修复范围。
+- `tc-direct-redirect-fast-path-plan.md`：TC direct redirect fast path 细化设计，记录
+  BPF ABI、userspace reconcile、fallback、metrics、测试和回滚计划。
+- `gateway-return-path-optimization-plan.md`：gateway 解封装后回程优化设计，记录反向
+  NAT 后的 FIB 查询、redirect、TTL/MTU、HA、回退和双向性能对照。
+- `backend-return-path-optimization-plan.md`：backend 回程优化候选方案，区分 host 与独立
+  容器网络，记录 VXLAN/DSCP 约束、状态学习、回退条件、PoC 和性能验证计划。
 - `cloudflare-unimog-reference.md`：Cloudflare Unimog eBPF/XDP L4LB 公开实现参考，
   记录其 XDP、GUE、forwarding table、健康状态和 TC redirector 设计，以及与 edge-lb
   当前架构的差异。

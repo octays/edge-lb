@@ -2,7 +2,7 @@
 
 use std::{fs, future::Future, net::IpAddr};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::{StreamExt, TryStreamExt};
 use rtnetlink::{
     LinkUnspec, LinkVxlan, new_connection,
@@ -17,8 +17,6 @@ use rtnetlink::{
         route::RouteType,
     },
 };
-
-use crate::config::Config;
 
 /// Ifindex of a device, read at runtime (never hardcoded: VXLAN ifindex
 /// changes whenever the link is recreated).
@@ -36,7 +34,7 @@ pub fn ifindex(dev: &str) -> Result<u32> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = dev;
-        bail!("interface operations require Linux")
+        anyhow::bail!("interface operations require Linux")
     }
 }
 
@@ -491,7 +489,7 @@ pub fn ensure_local_addrs(dev: &str, local_addrs: &[String]) -> Result<()> {
     })
 }
 
-fn run_netlink<F, T>(future: F) -> Result<T>
+pub(super) fn run_netlink<F, T>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + Send,
     T: Send,
@@ -499,6 +497,7 @@ where
     let run = move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .context("creating rtnetlink runtime")?
             .block_on(future)
@@ -624,41 +623,5 @@ async fn append_vxlan_fdb(
             return Err(rtnetlink::Error::NetlinkError(error));
         }
     }
-    Ok(())
-}
-
-/// Register `route_table_id route_table` in /etc/iproute2/rt_tables once.
-pub fn ensure_rt_tables(cfg: &Config) -> Result<()> {
-    let path = "/etc/iproute2/rt_tables";
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let wanted = format!(
-        "{} {}",
-        cfg.backend_cfg().route_table_id,
-        cfg.backend_cfg().route_table
-    );
-    if text.lines().any(|l| l.trim() == wanted) {
-        return Ok(());
-    }
-    if text
-        .lines()
-        .any(|l| l.split_whitespace().nth(1) == Some(&cfg.backend_cfg().route_table))
-    {
-        // Same name, different id: refuse to silently shadow it.
-        bail!(
-            "rt_tables already maps {} under a different id (wanted {wanted})",
-            cfg.backend_cfg().route_table
-        );
-    }
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {path} for append"))?;
-    writeln!(f, "{wanted}").context("failed to append rt_tables entry")?;
     Ok(())
 }

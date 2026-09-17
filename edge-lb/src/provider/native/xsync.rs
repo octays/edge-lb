@@ -20,7 +20,10 @@ use crate::{
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const PENDING_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const RECONCILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const RECONCILE_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
+const RECONCILE_RECOVERY_ROUNDS: u8 = 3;
 const MAX_SYNC_OPS_PER_BATCH: usize = 4096;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -248,98 +251,192 @@ enum FlowBatchState {
     Delete(edge_lb_common::NativeFlowKey),
 }
 
-fn fold_flow_mutations(
-    mutations: &[native_dnat::FlowMutation],
-) -> (
-    Vec<native_dnat::FlowEntry>,
-    Vec<edge_lb_common::NativeFlowKey>,
-) {
-    let mut states = HashMap::new();
-    for mutation in mutations {
-        match *mutation {
-            native_dnat::FlowMutation::Upsert(entry) => {
-                states.insert(entry.0, FlowBatchState::Upsert(entry));
-            }
-            native_dnat::FlowMutation::Delete(key) => {
-                states.insert(key, FlowBatchState::Delete(key));
-            }
-        }
-    }
-    split_flow_batch(states)
-}
-
-fn split_flow_batch(
+#[derive(Default)]
+struct PendingFlowBatch {
     states: HashMap<edge_lb_common::NativeFlowKey, FlowBatchState>,
-) -> (
-    Vec<native_dnat::FlowEntry>,
-    Vec<edge_lb_common::NativeFlowKey>,
-) {
-    let mut entries = Vec::new();
-    let mut deletes = Vec::new();
-    for state in states.into_values() {
-        match state {
-            FlowBatchState::Upsert(entry) => entries.push(entry),
-            FlowBatchState::Delete(key) => deletes.push(key),
-        }
-    }
-    (entries, deletes)
+    oldest_update_at: Option<Instant>,
 }
 
-fn collapse_latest_entries(entries: Vec<native_dnat::FlowEntry>) -> Vec<native_dnat::FlowEntry> {
-    let mut latest =
-        HashMap::<edge_lb_common::NativeFlowKey, edge_lb_common::NativeFlowValue>::new();
-    for (key, value) in entries {
-        if latest
-            .get(&key)
-            .is_none_or(|existing| value.last_seen_ns >= existing.last_seen_ns)
-        {
-            latest.insert(key, value);
-        }
-    }
-    let mut out = latest.into_iter().collect::<Vec<_>>();
-    out.sort_by_key(|(key, value)| {
-        (
-            key.src,
-            key.dst,
-            key.sport,
-            key.dport,
-            key.proto,
-            value.last_seen_ns,
-        )
-    });
-    out
+#[derive(Debug, Default)]
+struct FlowSyncBatch {
+    entries: Vec<native_dnat::FlowEntry>,
+    deletes: Vec<edge_lb_common::NativeFlowKey>,
 }
 
-fn collapse_delete_keys(
-    mut deletes: Vec<edge_lb_common::NativeFlowKey>,
-    entries: &[native_dnat::FlowEntry],
-) -> Vec<edge_lb_common::NativeFlowKey> {
-    let upserts = entries.iter().map(|(key, _)| *key).collect::<HashSet<_>>();
-    deletes.retain(|key| !upserts.contains(key));
-    deletes.sort_by_key(|key| (key.src, key.dst, key.sport, key.dport, key.proto));
-    deletes.dedup();
-    deletes
+impl FlowSyncBatch {
+    fn operation_count(&self) -> usize {
+        self.entries.len().saturating_add(self.deletes.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.deletes.is_empty()
+    }
+}
+
+impl PendingFlowBatch {
+    fn operation_count(&self) -> usize {
+        self.states.len()
+    }
+
+    fn apply_mutations(&mut self, mutations: &[native_dnat::FlowMutation], now: Instant) {
+        if mutations.is_empty() {
+            return;
+        }
+        self.mark_updated(now);
+        for mutation in mutations {
+            match *mutation {
+                native_dnat::FlowMutation::Upsert(entry) => self.apply_upsert(entry),
+                native_dnat::FlowMutation::Delete(key) => self.apply_delete(key),
+            }
+        }
+    }
+
+    fn apply_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = native_dnat::FlowEntry>,
+        now: Instant,
+    ) {
+        let mut updated = false;
+        for entry in entries {
+            if !updated {
+                self.mark_updated(now);
+                updated = true;
+            }
+            self.apply_upsert(entry);
+        }
+    }
+
+    fn apply_deletes(
+        &mut self,
+        deletes: impl IntoIterator<Item = edge_lb_common::NativeFlowKey>,
+        now: Instant,
+    ) {
+        let mut updated = false;
+        for key in deletes {
+            if !updated {
+                self.mark_updated(now);
+                updated = true;
+            }
+            self.apply_delete(key);
+        }
+    }
+
+    fn requeue_batch(&mut self, batch: FlowSyncBatch, now: Instant) {
+        self.apply_deletes(batch.deletes, now);
+        self.apply_entries(batch.entries, now);
+    }
+
+    fn should_flush(&self, now: Instant, force: bool) -> bool {
+        if self.states.is_empty() {
+            return false;
+        }
+        force
+            || self.states.len() >= MAX_SYNC_OPS_PER_BATCH
+            || self
+                .oldest_update_at
+                .is_some_and(|oldest| now.duration_since(oldest) >= PENDING_FLUSH_INTERVAL)
+    }
+
+    fn take_limited_batch(&mut self) -> FlowSyncBatch {
+        let mut keys = Vec::new();
+        for (key, state) in &self.states {
+            if matches!(state, FlowBatchState::Upsert(_)) {
+                keys.push(*key);
+                if keys.len() >= MAX_SYNC_OPS_PER_BATCH {
+                    break;
+                }
+            }
+        }
+        if keys.len() < MAX_SYNC_OPS_PER_BATCH {
+            for (key, state) in &self.states {
+                if matches!(state, FlowBatchState::Delete(_)) {
+                    keys.push(*key);
+                    if keys.len() >= MAX_SYNC_OPS_PER_BATCH {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut batch = FlowSyncBatch::default();
+        for key in keys {
+            match self.states.remove(&key) {
+                Some(FlowBatchState::Upsert(entry)) => batch.entries.push(entry),
+                Some(FlowBatchState::Delete(key)) => batch.deletes.push(key),
+                None => {}
+            }
+        }
+        if self.states.is_empty() {
+            self.oldest_update_at = None;
+        } else {
+            self.oldest_update_at = Some(Instant::now());
+        }
+        batch
+    }
+
+    fn apply_upsert(&mut self, entry: native_dnat::FlowEntry) {
+        let key = entry.0;
+        if self.states.get(&key).is_none_or(|existing| match existing {
+            FlowBatchState::Upsert((_, value)) => entry.1.last_seen_ns >= value.last_seen_ns,
+            FlowBatchState::Delete(_) => true,
+        }) {
+            self.states.insert(key, FlowBatchState::Upsert(entry));
+        }
+    }
+
+    fn apply_delete(&mut self, key: edge_lb_common::NativeFlowKey) {
+        self.states.insert(key, FlowBatchState::Delete(key));
+    }
+
+    fn mark_updated(&mut self, now: Instant) {
+        if self.oldest_update_at.is_none() {
+            self.oldest_update_at = Some(now);
+        }
+    }
+}
+
+struct FullReconcileSchedule {
+    next_at: Instant,
+    recovery_rounds: u8,
+}
+
+impl FullReconcileSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_at: now,
+            recovery_rounds: 0,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next_at
+    }
+
+    fn mark_completed(&mut self, now: Instant) {
+        let interval = if self.recovery_rounds > 0 {
+            self.recovery_rounds = self.recovery_rounds.saturating_sub(1);
+            RECONCILE_RECOVERY_INTERVAL
+        } else {
+            RECONCILE_HEALTHY_INTERVAL
+        };
+        self.next_at = now + interval;
+    }
+
+    fn force_recovery(&mut self, now: Instant) {
+        self.next_at = now;
+        self.recovery_rounds = RECONCILE_RECOVERY_ROUNDS;
+    }
 }
 
 fn flow_ack_covers_sent(expected: usize, accepted: u64) -> bool {
     usize::try_from(accepted) == Ok(expected)
 }
 
-fn limit_flow_batch(
-    mut entries: Vec<native_dnat::FlowEntry>,
-    mut deletes: Vec<edge_lb_common::NativeFlowKey>,
-) -> (
-    Vec<native_dnat::FlowEntry>,
-    Vec<edge_lb_common::NativeFlowKey>,
-) {
-    if entries.len() >= MAX_SYNC_OPS_PER_BATCH {
-        entries.truncate(MAX_SYNC_OPS_PER_BATCH);
-        deletes.clear();
-        return (entries, deletes);
+fn sweep_flows_for_xsync(cfg: &Config) -> Result<usize> {
+    if native_dnat::native_config_uses_least_connections(cfg)? {
+        native_dnat::sweep_flows_and_refresh_loads(cfg)
+    } else {
+        native_dnat::sweep_flows(cfg)
     }
-    let remaining = MAX_SYNC_OPS_PER_BATCH - entries.len();
-    deletes.truncate(remaining);
-    (entries, deletes)
 }
 
 pub fn run_worker(cfg: Config) {
@@ -424,7 +521,8 @@ async fn sync_session_grpc(
         .context("xSync handshake was not acknowledged")?;
     replica.clear();
     let mut events = native_dnat::open_flow_events(cfg)?;
-    let mut next_reconcile = Instant::now();
+    let mut reconcile = FullReconcileSchedule::new(Instant::now());
+    let mut pending = PendingFlowBatch::default();
     tracing::info!("[xsync] connected to {} via gRPC", endpoint);
     set_state("connected", Some(endpoint), None);
     loop {
@@ -439,43 +537,43 @@ async fn sync_session_grpc(
             .as_mut()
             .map(native_dnat::drain_flow_events)
             .unwrap_or_default();
-        let (mut entries, mut deletes) = fold_flow_mutations(&mutations);
-        if Instant::now() >= next_reconcile {
-            if let Err(error) = native_dnat::sweep_flows_and_refresh_loads(cfg) {
+        let now = Instant::now();
+        pending.apply_mutations(&mutations, now);
+        let mut force_flush = false;
+        if reconcile.due(now) {
+            if let Err(error) = sweep_flows_for_xsync(cfg) {
                 tracing::debug!("[xsync] native flow sweep skipped: {error:#}");
             }
             let flows = native_dnat::dump_flows(cfg)?;
             let current = flows.iter().map(|(key, _)| *key).collect::<HashSet<_>>();
-            entries.extend(flows.into_iter().filter(|(key, value)| {
+            let entries = flows.into_iter().filter(|(key, value)| {
                 replica
                     .get(key)
                     .is_none_or(|seen| value.last_seen_ns > *seen)
-            }));
-            deletes.extend(replica.keys().filter(|key| !current.contains(key)).copied());
-            next_reconcile = Instant::now() + RECONCILE_INTERVAL;
+            });
+            let deletes = replica.keys().filter(|key| !current.contains(key)).copied();
+            pending.apply_deletes(deletes, now);
+            pending.apply_entries(entries, now);
+            reconcile.mark_completed(Instant::now());
+            force_flush = true;
         }
-        entries.retain(|(key, value)| {
-            replica
-                .get(key)
-                .is_none_or(|seen| value.last_seen_ns > *seen)
-        });
-        entries = collapse_latest_entries(entries);
-        deletes = collapse_delete_keys(deletes, &entries);
-        let (limited_entries, limited_deletes) = limit_flow_batch(entries, deletes);
-        entries = limited_entries;
-        deletes = limited_deletes;
-        if !entries.is_empty() || !deletes.is_empty() {
-            let sent_entries = entries.len();
-            let sent_deletes = deletes.len();
+        if pending.should_flush(Instant::now(), force_flush) {
+            let batch = pending.take_limited_batch();
+            if batch.is_empty() {
+                tokio::time::sleep(EVENT_POLL_INTERVAL).await;
+                continue;
+            }
+            let expected = batch.operation_count();
             let sync_now_ns = native_dnat::monotonic_now_ns();
             tx.send(pb::FlowSyncRequest {
                 source: cfg.node_name.clone(),
                 token: token.clone(),
-                entries: entries
+                entries: batch
+                    .entries
                     .iter()
                     .map(|entry| entry_to_proto(entry, sync_now_ns))
                     .collect(),
-                deletes: deletes.iter().map(key_to_proto).collect(),
+                deletes: batch.deletes.iter().map(key_to_proto).collect(),
             })
             .await
             .context("sending xSync request")?;
@@ -483,20 +581,21 @@ async fn sync_session_grpc(
                 .await??
                 .context("xSync peer closed stream")?;
             set_ack(usize::try_from(ack.applied).unwrap_or(usize::MAX));
-            let expected = sent_entries.saturating_add(sent_deletes);
             if !flow_ack_covers_sent(expected, ack.applied) {
                 tracing::debug!(
                     "[xsync] peer accepted {} of {} flow operation(s); retaining replica backlog",
                     ack.applied,
                     expected
                 );
-                continue;
-            }
-            for (key, value) in entries {
-                replica.insert(key, value.last_seen_ns);
-            }
-            for key in deletes {
-                replica.remove(&key);
+                pending.requeue_batch(batch, Instant::now());
+                reconcile.force_recovery(Instant::now());
+            } else {
+                for (key, value) in batch.entries {
+                    replica.insert(key, value.last_seen_ns);
+                }
+                for key in batch.deletes {
+                    replica.remove(&key);
+                }
             }
         }
         tokio::time::sleep(EVENT_POLL_INTERVAL).await;
@@ -602,30 +701,45 @@ mod tests {
     }
 
     #[test]
-    fn flow_mutation_fold_keeps_last_operation_for_each_key() {
+    fn pending_flow_batch_keeps_last_operation_for_each_key() {
         let key = test_key(12345);
         let value = test_value(900);
-        let (entries, deletes) = super::fold_flow_mutations(&[
-            native_dnat::FlowMutation::Delete(key),
-            native_dnat::FlowMutation::Upsert((key, value)),
-        ]);
+        let mut pending = super::PendingFlowBatch::default();
 
-        assert_eq!(entries, vec![(key, value)]);
-        assert!(deletes.is_empty());
+        pending.apply_mutations(
+            &[
+                native_dnat::FlowMutation::Delete(key),
+                native_dnat::FlowMutation::Upsert((key, value)),
+            ],
+            std::time::Instant::now(),
+        );
+        let batch = pending.take_limited_batch();
+
+        assert_eq!(batch.entries, vec![(key, value)]);
+        assert!(batch.deletes.is_empty());
+        assert_eq!(pending.operation_count(), 0);
     }
 
     #[test]
-    fn flow_batch_keeps_latest_upsert_and_drops_shadowed_delete() {
+    fn pending_flow_batch_keeps_latest_upsert_and_drops_shadowed_delete() {
         let key = test_key(12345);
-        let entries = super::collapse_latest_entries(vec![
-            (key, test_value(900)),
-            (key, test_value(1_100)),
-            (test_key(12346), test_value(1_000)),
-        ]);
-        let deletes = super::collapse_delete_keys(vec![key, key], &entries);
+        let mut pending = super::PendingFlowBatch::default();
+        let now = std::time::Instant::now();
+
+        pending.apply_deletes([key, key], now);
+        pending.apply_entries(
+            [
+                (key, test_value(900)),
+                (key, test_value(1_100)),
+                (test_key(12346), test_value(1_000)),
+            ],
+            now,
+        );
+        let batch = pending.take_limited_batch();
 
         assert_eq!(
-            entries
+            batch
+                .entries
                 .iter()
                 .find(|(item, _)| *item == key)
                 .unwrap()
@@ -633,7 +747,7 @@ mod tests {
                 .last_seen_ns,
             1_100
         );
-        assert!(deletes.is_empty());
+        assert!(batch.deletes.is_empty());
     }
 
     #[test]
@@ -645,28 +759,95 @@ mod tests {
 
     #[test]
     fn flow_batch_limit_prioritizes_upserts_and_defers_excess_deletes() {
-        let entries = (0..super::MAX_SYNC_OPS_PER_BATCH)
-            .map(|idx| (test_key(idx as u16), test_value(u64::from(idx as u32))))
-            .collect::<Vec<_>>();
-        let deletes = vec![test_key(60_000)];
+        let mut pending = super::PendingFlowBatch::default();
+        let now = std::time::Instant::now();
 
-        let (entries, deletes) = super::limit_flow_batch(entries, deletes);
+        pending.apply_entries(
+            (0..super::MAX_SYNC_OPS_PER_BATCH)
+                .map(|idx| (test_key(idx as u16), test_value(u64::from(idx as u32)))),
+            now,
+        );
+        pending.apply_deletes([test_key(60_000)], now);
+        let batch = pending.take_limited_batch();
 
-        assert_eq!(entries.len(), super::MAX_SYNC_OPS_PER_BATCH);
-        assert!(deletes.is_empty());
+        assert_eq!(batch.entries.len(), super::MAX_SYNC_OPS_PER_BATCH);
+        assert!(batch.deletes.is_empty());
+        assert_eq!(pending.operation_count(), 1);
     }
 
     #[test]
     fn flow_batch_limit_keeps_total_operations_bounded() {
-        let entries = vec![(test_key(1), test_value(1))];
-        let deletes = (0..super::MAX_SYNC_OPS_PER_BATCH)
-            .map(|idx| test_key(idx as u16))
-            .collect::<Vec<_>>();
+        let mut pending = super::PendingFlowBatch::default();
+        let now = std::time::Instant::now();
 
-        let (entries, deletes) = super::limit_flow_batch(entries, deletes);
+        pending.apply_entries([(test_key(60_000), test_value(1))], now);
+        pending.apply_deletes(
+            (0..super::MAX_SYNC_OPS_PER_BATCH).map(|idx| test_key(idx as u16)),
+            now,
+        );
+        let batch = pending.take_limited_batch();
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(deletes.len(), super::MAX_SYNC_OPS_PER_BATCH - 1);
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.deletes.len(), super::MAX_SYNC_OPS_PER_BATCH - 1);
+        assert_eq!(batch.operation_count(), super::MAX_SYNC_OPS_PER_BATCH);
+        assert_eq!(pending.operation_count(), 1);
+    }
+
+    #[test]
+    fn pending_flow_batch_requeues_unacked_batch() {
+        let key = test_key(12345);
+        let value = test_value(900);
+        let mut pending = super::PendingFlowBatch::default();
+        let now = std::time::Instant::now();
+
+        pending.apply_entries([(key, value)], now);
+        let batch = pending.take_limited_batch();
+        assert_eq!(pending.operation_count(), 0);
+
+        pending.requeue_batch(batch, now);
+        let batch = pending.take_limited_batch();
+
+        assert_eq!(batch.entries, vec![(key, value)]);
+        assert!(batch.deletes.is_empty());
+    }
+
+    #[test]
+    fn pending_flow_batch_flushes_after_delay_or_batch_limit() {
+        let mut pending = super::PendingFlowBatch::default();
+        let now = std::time::Instant::now();
+
+        assert!(!pending.should_flush(now, false));
+        pending.apply_entries([(test_key(1), test_value(1))], now);
+
+        assert!(!pending.should_flush(now, false));
+        assert!(pending.should_flush(now, true));
+        assert!(pending.should_flush(now + super::PENDING_FLUSH_INTERVAL, false));
+    }
+
+    #[test]
+    fn full_reconcile_schedule_starts_due_then_uses_healthy_interval() {
+        let now = std::time::Instant::now();
+        let mut schedule = super::FullReconcileSchedule::new(now);
+
+        assert!(schedule.due(now));
+        schedule.mark_completed(now);
+
+        assert!(!schedule.due(now + super::RECONCILE_HEALTHY_INTERVAL / 2));
+        assert!(schedule.due(now + super::RECONCILE_HEALTHY_INTERVAL));
+    }
+
+    #[test]
+    fn full_reconcile_schedule_uses_recovery_rounds_after_forced_repair() {
+        let now = std::time::Instant::now();
+        let mut schedule = super::FullReconcileSchedule::new(now);
+
+        schedule.mark_completed(now);
+        schedule.force_recovery(now);
+
+        assert!(schedule.due(now));
+        schedule.mark_completed(now);
+        assert!(!schedule.due(now + super::RECONCILE_RECOVERY_INTERVAL / 2));
+        assert!(schedule.due(now + super::RECONCILE_RECOVERY_INTERVAL));
     }
 
     fn test_key(sport: u16) -> NativeFlowKey {

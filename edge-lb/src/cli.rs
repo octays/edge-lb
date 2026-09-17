@@ -264,11 +264,11 @@ pub struct BackendArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BackendCommand {
-    /// Converge the backend: VXLAN, nftables return path, policy routing.
+    /// Converge the backend: VXLAN and Redirect-only return path.
     Apply,
     /// Watch the active gateway and switch the return path on change.
     Run,
-    /// Print VXLAN, ip rule, route table and return-path state.
+    /// Print VXLAN, Redirect return path, and legacy return-path state.
     Show,
     /// Remove only the objects this agent created on the backend.
     Cleanup,

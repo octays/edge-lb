@@ -102,3 +102,28 @@ algorithms such as `consistent_hash`; each request binds a fresh ephemeral
 source port, so the source port sample count grows with request count instead
 of worker count. Direct backend tests are useful only for isolation. HA
 conclusions should be based on requests to the VIP.
+
+## Raw Result Integrity
+
+`--out` writes TSV columns `timestamp_ms`, `protocol`, `source_port`, `ok`,
+`latency_us`, `backend`, and `error`. `timestamp_ms` is the request start time
+(Unix milliseconds); `ok` is 0 or 1. A timeout's completion is later than its
+timestamp by approximately `latency_us`.
+
+The header is flushed before workers send traffic. A header write/flush error
+exits with status 1 immediately. Later write errors are retained while workers
+finish; final write/flush errors or a mismatch between recorded rows and total
+requests also exit with status 1, without printing a successful `raw_results`
+summary. Worker panics invalidate the run as well. Buffered output is not a
+crash-durable audit log and is not flushed on every request.
+
+After a successful output check, the summary includes `raw_rows` (excluding the
+header). Verify the downloaded TSV row count against this value before using
+it for HA event correlation. Exit status 0 alone does not mean all network
+requests succeeded: inspect each protocol's `fail` count too.
+
+Use a destination with available user quota as well as free space. In the
+2026-09-16 test environment, `/tmp` had free space but writes failed with
+`Disk quota exceeded`; `/home/ubuntu` successfully stored the samples. The old
+client ignored write errors and printed `raw_results` even for `/dev/full`.
+An empty old TSV cannot be recovered from its summary.

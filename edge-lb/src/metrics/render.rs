@@ -50,6 +50,20 @@ pub fn render_gateway(cfg: &Config) -> String {
         bool_value(crate::linux::native_dnat::attached(cfg)),
         Some("gauge"),
     );
+    metric_line(
+        &mut out,
+        "edge_lb_gateway_native_flow_map_capacity",
+        &[],
+        edge_lb_common::NATIVE_FLOW_MAP_CAPACITY as u64,
+        Some("gauge"),
+    );
+    metric_line(
+        &mut out,
+        "edge_lb_gateway_native_flow_pair_capacity",
+        &[],
+        edge_lb_common::NATIVE_FLOW_PAIR_CAPACITY as u64,
+        Some("gauge"),
+    );
 
     if let Ok(stats) = crate::linux::dscp::stats(cfg) {
         metric_line(
@@ -139,7 +153,24 @@ pub fn render_gateway(cfg: &Config) -> String {
             stats.chash_fallback,
             Some("counter"),
         );
+        metric_line(
+            &mut out,
+            "edge_lb_gateway_native_flow_event_lost_total",
+            &[],
+            stats.flow_event_lost,
+            Some("counter"),
+        );
     }
+
+    render_redirect_metrics(
+        &mut out,
+        crate::linux::native_dnat::redirect_stats(cfg).ok(),
+    );
+    render_redirect_admission_metrics(&mut out, crate::linux::redirect::admission_status());
+    render_return_redirect_metrics(
+        &mut out,
+        crate::linux::native_dnat::return_redirect_stats(cfg).ok(),
+    );
 
     if let Ok(digests) = crate::linux::native_dnat::consistent_hash_bucket_digests(cfg) {
         for digest in digests {
@@ -252,6 +283,126 @@ fn render_flow_persistence_metrics(out: &mut String) {
 
 fn bool_value(value: bool) -> u64 {
     if value { 1 } else { 0 }
+}
+
+fn render_redirect_metrics(
+    out: &mut String,
+    stats: Option<edge_lb_common::redirect::NativeRedirectStats>,
+) {
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_stats_available",
+        &[],
+        u64::from(stats.is_some()),
+        Some("gauge"),
+    );
+    let Some(stats) = stats else {
+        return;
+    };
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_submitted_total",
+        &[],
+        stats.submitted,
+        Some("counter"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_mutation_error_total",
+        &[],
+        stats.mutation_error,
+        Some("counter"),
+    );
+    for (index, (reason, value)) in [
+        ("route_miss", stats.route_miss),
+        ("route_invalid", stats.route_invalid),
+        ("expired", stats.expired),
+        ("target_changed", stats.target_changed),
+        ("ttl", stats.ttl),
+        ("mtu", stats.mtu),
+        ("unsupported", stats.unsupported),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        metric_line(
+            out,
+            "edge_lb_gateway_native_redirect_fallback_total",
+            &[("reason", reason)],
+            value,
+            (index == 0).then_some("counter"),
+        );
+    }
+}
+
+fn render_redirect_admission_metrics(
+    out: &mut String,
+    status: crate::linux::redirect::RedirectAdmissionStatus,
+) {
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_admission_status",
+        &[("state", status.state), ("reason", status.reason)],
+        1,
+        Some("gauge"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_redirect_admission_updated_seconds",
+        &[],
+        status.updated_unix_seconds,
+        Some("gauge"),
+    );
+}
+
+fn render_return_redirect_metrics(
+    out: &mut String,
+    stats: Option<edge_lb_common::return_redirect::ReturnRedirectStats>,
+) {
+    metric_line(
+        out,
+        "edge_lb_gateway_native_return_redirect_stats_available",
+        &[],
+        u64::from(stats.is_some()),
+        Some("gauge"),
+    );
+    let Some(stats) = stats else {
+        return;
+    };
+    metric_line(
+        out,
+        "edge_lb_gateway_native_return_redirect_submitted_total",
+        &[],
+        stats.submitted,
+        Some("counter"),
+    );
+    metric_line(
+        out,
+        "edge_lb_gateway_native_return_redirect_mutation_error_total",
+        &[],
+        stats.mutation_error,
+        Some("counter"),
+    );
+    for (index, (reason, value)) in [
+        ("policy", stats.policy),
+        ("expired", stats.expired),
+        ("route", stats.route),
+        ("neighbor", stats.neighbor),
+        ("ttl", stats.ttl),
+        ("mtu", stats.mtu),
+        ("unsupported", stats.unsupported),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        metric_line(
+            out,
+            "edge_lb_gateway_native_return_redirect_fallback_total",
+            &[("reason", reason)],
+            value,
+            (index == 0).then_some("counter"),
+        );
+    }
 }
 
 fn metric_line(
@@ -536,6 +687,96 @@ fn parse_kib_line(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_redirect_stats_do_not_fabricate_counters() {
+        let mut out = String::new();
+        render_redirect_metrics(&mut out, None);
+        assert!(out.contains("edge_lb_gateway_native_redirect_stats_available 0\n"));
+        assert!(!out.contains("_total"));
+    }
+
+    #[test]
+    fn return_redirect_metrics_have_bounded_reasons_and_no_fabricated_counters() {
+        let mut out = String::new();
+        render_return_redirect_metrics(&mut out, None);
+        assert!(out.contains("edge_lb_gateway_native_return_redirect_stats_available 0\n"));
+        assert!(!out.contains("_total"));
+        out.clear();
+        render_return_redirect_metrics(
+            &mut out,
+            Some(edge_lb_common::return_redirect::ReturnRedirectStats {
+                submitted: 9,
+                neighbor: 3,
+                mutation_error: 1,
+                ..Default::default()
+            }),
+        );
+        assert!(out.contains("edge_lb_gateway_native_return_redirect_submitted_total 9\n"));
+        assert!(out.contains(
+            "edge_lb_gateway_native_return_redirect_fallback_total{reason=\"neighbor\"} 3\n"
+        ));
+        assert!(out.contains("edge_lb_gateway_native_return_redirect_mutation_error_total 1\n"));
+        assert_eq!(
+            out.matches("# TYPE edge_lb_gateway_native_return_redirect_fallback_total counter\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.starts_with("edge_lb_gateway_native_return_redirect_fallback_total{"))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn redirect_stats_have_fixed_reasons_and_one_type_declaration() {
+        let mut out = String::new();
+        render_redirect_metrics(
+            &mut out,
+            Some(edge_lb_common::redirect::NativeRedirectStats {
+                submitted: 10,
+                route_miss: 11,
+                mutation_error: 2,
+                ..Default::default()
+            }),
+        );
+        assert!(out.contains("edge_lb_gateway_native_redirect_stats_available 1\n"));
+        assert!(out.contains("edge_lb_gateway_native_redirect_submitted_total 10\n"));
+        assert!(out.contains("edge_lb_gateway_native_redirect_mutation_error_total 2\n"));
+        assert!(out.contains(
+            "edge_lb_gateway_native_redirect_fallback_total{reason=\"route_miss\"} 11\n"
+        ));
+        assert_eq!(
+            out.matches("# TYPE edge_lb_gateway_native_redirect_fallback_total counter\n")
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.starts_with("edge_lb_gateway_native_redirect_fallback_total{"))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn redirect_admission_metric_has_bounded_status_labels() {
+        let mut out = String::new();
+        render_redirect_admission_metrics(
+            &mut out,
+            crate::linux::redirect::RedirectAdmissionStatus {
+                state: "blocked",
+                reason: "rp_filter",
+                updated_unix_seconds: 123,
+            },
+        );
+        assert!(out.contains(
+            "edge_lb_gateway_native_redirect_admission_status{state=\"blocked\",reason=\"rp_filter\"} 1\n"
+        ));
+        assert!(out.contains("edge_lb_gateway_native_redirect_admission_updated_seconds 123\n"));
+    }
 
     #[test]
     fn labels_are_escaped_for_prometheus_text() {

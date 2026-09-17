@@ -146,7 +146,6 @@ pub(super) fn validate(file: &FileConfig) -> Result<()> {
                         probe_port: group.probe_port,
                         probe_req: group.probe_req.as_deref(),
                         probe_resp: group.probe_resp.as_deref(),
-                        probe_status: group.probe_status,
                         skip_tls_verify: group.probe_skip_tls_verify,
                         period_secs: group.period_secs,
                         retries: group.retries,
@@ -393,7 +392,6 @@ struct ProbeConfig<'a> {
     probe_port: Option<u16>,
     probe_req: Option<&'a str>,
     probe_resp: Option<&'a str>,
-    probe_status: Option<u16>,
     skip_tls_verify: bool,
     period_secs: Option<u32>,
     retries: Option<u32>,
@@ -427,14 +425,6 @@ fn validate_probe_config(label: &str, probe: ProbeConfig<'_>) -> Result<()> {
         || probe.probe_resp.is_some_and(|v| !v.trim().is_empty());
     if has_payload && !matches!(normalized.as_str(), "tcp" | "udp" | "http" | "https") {
         bail!("{label} probe_req/probe_resp are only valid for tcp/udp/http/https probes");
-    }
-    if let Some(status) = probe.probe_status
-        && !(100..=599).contains(&status)
-    {
-        bail!("{label} probe_status must be in range 100..=599");
-    }
-    if probe.probe_status.is_some() && !matches!(normalized.as_str(), "http" | "https") {
-        bail!("{label} probe_status is only valid for http/https probes");
     }
     if probe.skip_tls_verify && normalized != "https" {
         bail!("{label} probe_skip_tls_verify is only valid for https probes");

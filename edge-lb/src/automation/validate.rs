@@ -53,11 +53,6 @@ pub fn normalize_template(template: &mut AutomationTemplate) -> Result<()> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
-            if let Some(status) = template.target_group.probe_status
-                && !(100..=599).contains(&status)
-            {
-                bail!("expected HTTP status must be in range 100..=599");
-            }
             if template.target_group.probe_skip_tls_verify && probe_type != "https" {
                 bail!("skip TLS verification is only valid for HTTPS probes");
             }
@@ -76,12 +71,10 @@ pub fn normalize_template(template: &mut AutomationTemplate) -> Result<()> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned);
-            template.target_group.probe_status = None;
             template.target_group.probe_skip_tls_verify = false;
         } else {
             template.target_group.probe_req = None;
             template.target_group.probe_resp = None;
-            template.target_group.probe_status = None;
             template.target_group.probe_skip_tls_verify = false;
         }
         if !matches!(probe_type.as_str(), "ping") && template.target_group.probe_port.is_none() {
@@ -96,7 +89,6 @@ pub fn normalize_template(template: &mut AutomationTemplate) -> Result<()> {
         template.target_group.probe_type = Some("none".to_string());
         template.target_group.probe_req = None;
         template.target_group.probe_resp = None;
-        template.target_group.probe_status = None;
         template.target_group.probe_skip_tls_verify = false;
     }
     validate_template(template)
@@ -261,7 +253,6 @@ mod tests {
                 probe_port: Some(9999),
                 probe_req: Some(" health ".to_string()),
                 probe_resp: Some(" ok ".to_string()),
-                probe_status: Some(200),
                 probe_skip_tls_verify: true,
                 ..TargetGroupTemplate::default()
             },
@@ -272,7 +263,6 @@ mod tests {
 
         assert_eq!(template.target_group.probe_req.as_deref(), Some("health"));
         assert_eq!(template.target_group.probe_resp.as_deref(), Some("ok"));
-        assert_eq!(template.target_group.probe_status, None);
         assert!(!template.target_group.probe_skip_tls_verify);
     }
 }

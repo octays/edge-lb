@@ -485,10 +485,6 @@ fn planned_target_group_for_nodes(
         probe_resp: payload_probe
             .then(|| template.target_group.probe_resp.clone())
             .flatten(),
-        probe_status: payload_probe
-            .then_some(template.target_group.probe_status)
-            .flatten()
-            .filter(|_| matches!(probe_type.as_deref(), Some("http" | "https"))),
         probe_skip_tls_verify: template.target_group.probe_skip_tls_verify
             && matches!(probe_type.as_deref(), Some("https")),
         period_secs: template.target_group.period_secs,

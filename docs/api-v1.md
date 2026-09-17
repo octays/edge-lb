@@ -36,8 +36,10 @@ Native flow-state xSync uses the `FlowSync` gRPC service on the control-plane
 port, not an HTTP API endpoint.
 
 `POST /api/v1/ha/peer/activate` is a peer-only operation used by coordinated
-manual failover. The receiving gateway accepts the request only when the target
-is itself, then binds the configured L2 VIP and announces it before replying.
+manual failover. The receiving gateway applies its local role for the requested
+active gateway before committing local active state: if the target is itself, it
+binds the configured L2 VIP and announces it before replying; if the target is
+the paired gateway, it demotes locally before acknowledging.
 
 Whole-file config replacement, metrics, legacy `operations/failover`, and
 HTTP verify endpoints are not part of the public v1 surface. Use the resource

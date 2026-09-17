@@ -110,8 +110,6 @@ pub struct HealthProbeConfig {
     #[serde(default)]
     pub probe_resp: Option<String>,
     #[serde(default)]
-    pub expected_status: Option<u16>,
-    #[serde(default)]
     pub skip_tls_verify: bool,
     #[serde(default)]
     pub probe_duration: Option<u32>,

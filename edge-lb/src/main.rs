@@ -1,8 +1,8 @@
 //! edge-lb: unified agent for the Edge LB VXLAN return-path scheme.
 //!
 //! Gateway side: native default-mode listener rules, DSCP marking, xDS control
-//! plane, HTTP API, and UI. Backend side: xDS subscription, nft ct-mark
-//! steering, policy routing, and VXLAN return tunnel switching.
+//! plane, HTTP API, and UI. Backend side: xDS subscription, Redirect-only
+//! return steering, and VXLAN return tunnel switching.
 
 mod api;
 mod automation;
@@ -172,13 +172,21 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn command_needs_runtime_storage(command: &Commands, file: &FileConfig) -> bool {
-    matches!(
-        (command, file.node_role),
-        (Commands::Gateway(_), crate::config::NodeRole::Gateway)
-            | (Commands::Backend(_), crate::config::NodeRole::Backend)
-            | (Commands::Ui { .. }, _)
-            | (Commands::Verify(_), _)
-    )
+    match command {
+        Commands::Gateway(args) => {
+            file.node_role == crate::config::NodeRole::Gateway
+                && !matches!(args.command, GatewayCommand::Show)
+        }
+        Commands::Backend(args) => {
+            file.node_role == crate::config::NodeRole::Backend
+                && !matches!(args.command, BackendCommand::Show)
+        }
+        Commands::Ui { .. } | Commands::Verify(_) => true,
+        Commands::Config { .. }
+        | Commands::Install(_)
+        | Commands::Uninstall { .. }
+        | Commands::Internal { .. } => false,
+    }
 }
 
 fn run_internal(command: InternalCommand) -> Result<()> {
@@ -284,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_commands_initialize_local_ownership_storage_but_config_commands_do_not() {
+    fn backend_mutating_commands_initialize_storage_but_show_and_config_do_not() {
         let backend_file = FileConfig {
             node_role: crate::config::NodeRole::Backend,
             ..FileConfig::default()
@@ -298,7 +306,6 @@ mod tests {
             BackendCommand::Run,
             BackendCommand::Apply,
             BackendCommand::Cleanup,
-            BackendCommand::Show,
         ] {
             assert!(command_needs_runtime_storage(
                 &Commands::Backend(cli::BackendArgs {
@@ -308,6 +315,20 @@ mod tests {
                 &backend_file
             ));
         }
+        assert!(!command_needs_runtime_storage(
+            &Commands::Backend(cli::BackendArgs {
+                command: BackendCommand::Show,
+                overrides: Overrides::default(),
+            }),
+            &backend_file
+        ));
+        assert!(!command_needs_runtime_storage(
+            &Commands::Gateway(cli::GatewayArgs {
+                command: GatewayCommand::Show,
+                overrides: Overrides::default(),
+            }),
+            &gateway_file
+        ));
         assert!(!command_needs_runtime_storage(
             &Commands::Config {
                 command: ConfigCommand::Validate {

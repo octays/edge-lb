@@ -709,7 +709,6 @@ stun_servers = [" stun.example.test:3478 ", "stun.backup.test:3478"]
                 probe_port: Some(8080),
                 probe_req: Some("/health".to_string()),
                 probe_resp: None,
-                probe_status: None,
                 probe_skip_tls_verify: false,
                 period_secs: Some(10),
                 retries: Some(2),

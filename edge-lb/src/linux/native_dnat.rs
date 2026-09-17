@@ -2,7 +2,8 @@
 //!
 //! The daemon owns the Aya object and its maps. The ingress program performs
 //! the forward rewrite and the return program restores the listener source on
-//! packets arriving from the backend overlay.
+//! packets arriving from the backend overlay or directly from the backend
+//! underlay path.
 
 use std::{
     collections::{BTreeMap, HashMap as StdHashMap, HashSet},
@@ -24,6 +25,8 @@ use edge_lb_common::{
     NativeConsistentHashBucketKey, NativeConsistentHashBucketValue, NativeListenerLookupKey,
     NativeListenerLookupValue, NativeTargetKey, NativeTargetLoadKey, NativeTargetValue,
     native_consistent_bucket_score,
+    redirect::{NATIVE_LOCAL_ADDRS_MAP, NATIVE_REDIRECT_STATS_MAP, NATIVE_TARGET_ROUTES_MAP},
+    return_redirect::{NATIVE_RETURN_LEASES_MAP, NATIVE_RETURN_STATS_MAP},
 };
 use sha2::{Digest, Sha256};
 
@@ -34,15 +37,15 @@ use crate::{
     },
 };
 
-const LISTENERS: &str = "NATIVE_LISTENERS";
-const TARGETS: &str = "NATIVE_TARGETS";
+const LISTENERS: &str = edge_lb_common::NATIVE_LISTENERS_MAP;
+const TARGETS: &str = edge_lb_common::NATIVE_TARGETS_MAP;
 const CHASH_BUCKETS: &str = "NATIVE_CHASH_BUCKETS";
 const FLOWS: &str = "NATIVE_FLOWS";
 const STATS: &str = "NATIVE_STATS";
 const FLOW_EVENTS: &str = "NATIVE_FLOW_EVENTS";
 const RR_COUNTERS: &str = "NATIVE_RR_COUNTERS";
 const ACTIVE_FLOWS: &str = "NATIVE_ACTIVE_FLOWS";
-const MAPS: [&str; 8] = [
+const MAPS: [&str; 13] = [
     LISTENERS,
     TARGETS,
     CHASH_BUCKETS,
@@ -51,6 +54,11 @@ const MAPS: [&str; 8] = [
     ACTIVE_FLOWS,
     STATS,
     FLOW_EVENTS,
+    NATIVE_TARGET_ROUTES_MAP,
+    NATIVE_REDIRECT_STATS_MAP,
+    NATIVE_LOCAL_ADDRS_MAP,
+    NATIVE_RETURN_LEASES_MAP,
+    NATIVE_RETURN_STATS_MAP,
 ];
 const INGRESS_PREF_OFFSET: u16 = 10;
 const RETURN_PREF_OFFSET: u16 = 11;
@@ -95,12 +103,21 @@ impl Drop for NativeDnatAttachment {
             TcAttachType::Ingress,
             NATIVE_DNAT_RETURN_PROGRAM,
         );
+        let _ = qdisc_detach_program(
+            &self.underlay,
+            TcAttachType::Ingress,
+            NATIVE_DNAT_RETURN_PROGRAM,
+        );
         crate::linux::tc::delete_ingress_pref_best_effort(
             &self.underlay,
             self.pref + INGRESS_PREF_OFFSET,
         );
         crate::linux::tc::delete_ingress_pref_best_effort(
             &self.overlay,
+            self.pref + RETURN_PREF_OFFSET,
+        );
+        crate::linux::tc::delete_ingress_pref_best_effort(
+            &self.underlay,
             self.pref + RETURN_PREF_OFFSET,
         );
         for name in MAPS {
@@ -126,6 +143,10 @@ fn pin_path(cfg: &Config, name: &str) -> PathBuf {
     pin_dir(cfg).join(name)
 }
 
+pub fn redirect_route_pin(cfg: &Config) -> PathBuf {
+    pin_path(cfg, NATIVE_TARGET_ROUTES_MAP)
+}
+
 fn read_object() -> Result<Vec<u8>> {
     if let Some(bytes) = embedded::embedded_ebpf() {
         return Ok(bytes.to_vec());
@@ -135,13 +156,26 @@ fn read_object() -> Result<Vec<u8>> {
     ))
 }
 
-pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
+fn prepare_object() -> Result<Ebpf> {
+    let mut bpf = Ebpf::load(&read_object()?).context("loading native DNAT object")?;
+    for name in [NATIVE_DNAT_INGRESS_PROGRAM, NATIVE_DNAT_RETURN_PROGRAM] {
+        let program: &mut SchedClassifier = bpf
+            .program_mut(name)
+            .with_context(|| format!("missing {name}"))?
+            .try_into()?;
+        program
+            .load()
+            .with_context(|| format!("verifying {name}; existing attachment retained"))?;
+    }
+    Ok(bpf)
+}
+
+fn attach_prepared(cfg: &Config, mut bpf: Ebpf) -> Result<NativeDnatAttachment> {
     let listeners = listeners_from_config(cfg)?;
     if listeners.is_empty() {
         bail!("native DNAT requires at least one listener");
     }
     let n = cfg.network();
-    let mut bpf = Ebpf::load(&read_object()?).context("failed to load native DNAT eBPF object")?;
     let observed_targets = target_health_native(cfg).ok();
     let pin_dir = pin_dir(cfg);
     fs::create_dir_all(&pin_dir)
@@ -249,12 +283,19 @@ pub fn attach_owned(cfg: &Config) -> Result<NativeDnatAttachment> {
     crate::linux::tc::add_clsact_best_effort(&n.underlay_dev);
     crate::linux::tc::add_clsact_best_effort(&n.vxlan_dev);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + INGRESS_PREF_OFFSET);
+    crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + RETURN_PREF_OFFSET);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.vxlan_dev, pref + RETURN_PREF_OFFSET);
     attach_program(
         &mut bpf,
         NATIVE_DNAT_INGRESS_PROGRAM,
         &n.underlay_dev,
         pref + INGRESS_PREF_OFFSET,
+    )?;
+    attach_program(
+        &mut bpf,
+        NATIVE_DNAT_RETURN_PROGRAM,
+        &n.underlay_dev,
+        pref + RETURN_PREF_OFFSET,
     )?;
     attach_program(
         &mut bpf,
@@ -340,7 +381,6 @@ fn attach_program(bpf: &mut Ebpf, name: &str, dev: &str, priority: u16) -> Resul
         .ok_or_else(|| anyhow!("{name} program missing"))?
         .try_into()
         .with_context(|| format!("{name} is not a TC classifier"))?;
-    program.load().with_context(|| format!("loading {name}"))?;
     program
         .attach_with_options(
             dev,
@@ -367,6 +407,7 @@ pub fn apply(cfg: &Config) -> Result<()> {
         return cleanup(cfg);
     }
     let signature = format!("{listeners:?}");
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let mut current_signature = CURRENT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner());
     // Keep the running programs and flow map in place while only listener,
@@ -385,10 +426,13 @@ pub fn apply(cfg: &Config) -> Result<()> {
             return Ok(());
         }
     }
+    // Verify helpers and both programs before removing the running datapath.
+    // A missing FIB helper cannot be hidden by an empty lease map at runtime.
+    let prepared = prepare_object()?;
     if let Some(old) = current.take() {
         drop(old);
     }
-    *current = Some(attach_owned(cfg)?);
+    *current = Some(attach_prepared(cfg, prepared)?);
     *current_signature = Some(signature);
     Ok(())
 }
@@ -790,7 +834,21 @@ pub fn dump_flows(cfg: &Config) -> Result<Vec<FlowEntry>> {
     Ok(out)
 }
 
+pub fn native_config_uses_least_connections(cfg: &Config) -> Result<bool> {
+    Ok(listeners_from_config(cfg)?
+        .iter()
+        .any(|listener| listener.select == crate::config::LbSelect::Lc.code()))
+}
+
+pub fn sweep_flows(cfg: &Config) -> Result<usize> {
+    sweep_flows_inner(cfg, false)
+}
+
 pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
+    sweep_flows_inner(cfg, true)
+}
+
+fn sweep_flows_inner(cfg: &Config, refresh_loads: bool) -> Result<usize> {
     let now = monotonic_now_ns();
     let Some(mut flows) = open_pinned_flows(cfg)? else {
         return Ok(0);
@@ -805,22 +863,26 @@ pub fn sweep_flows_and_refresh_loads(cfg: &Config) -> Result<usize> {
             expired.push(key);
             continue;
         }
-        let pair = canonical_flow_pair(key, value);
-        if seen_pairs.insert(pair) {
-            let load_key = NativeTargetLoadKey {
-                listener_id: value.listener_id,
-                target_id: value.target_id,
-            };
-            loads
-                .entry(load_key)
-                .and_modify(|load| *load = load.saturating_add(1))
-                .or_insert(1);
+        if refresh_loads {
+            let pair = canonical_flow_pair(key, value);
+            if seen_pairs.insert(pair) {
+                let load_key = NativeTargetLoadKey {
+                    listener_id: value.listener_id,
+                    target_id: value.target_id,
+                };
+                loads
+                    .entry(load_key)
+                    .and_modify(|load| *load = load.saturating_add(1))
+                    .or_insert(1);
+            }
         }
     }
     for key in &expired {
         let _ = flows.remove(key);
     }
-    replace_active_flows(cfg, &loads)?;
+    if refresh_loads {
+        replace_active_flows(cfg, &loads)?;
+    }
     Ok(expired.len())
 }
 
@@ -962,6 +1024,7 @@ pub fn refresh_target_health(cfg: &Config) -> Result<()> {
     let listeners = listeners_from_config(cfg)?;
     let listener_ids = stable_listener_assignments(&listeners)?;
     let observed = target_health_native(cfg).ok();
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     sync_target_map(cfg, &listener_ids)?;
     sync_consistent_hash_bucket_map(cfg, &listener_ids)?;
     refresh_listener_weights(cfg, &listeners, observed.as_ref())?;
@@ -1012,6 +1075,7 @@ fn refresh_listener_weights(
 }
 
 pub fn cleanup(cfg: &Config) -> Result<()> {
+    let _redirect_mutation = super::redirect::begin_mutation(&redirect_route_pin(cfg))?;
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     let mut current_signature = CURRENT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = current.take() {
@@ -1030,7 +1094,13 @@ pub fn cleanup(cfg: &Config) -> Result<()> {
         TcAttachType::Ingress,
         NATIVE_DNAT_RETURN_PROGRAM,
     );
+    let _ = qdisc_detach_program(
+        &n.underlay_dev,
+        TcAttachType::Ingress,
+        NATIVE_DNAT_RETURN_PROGRAM,
+    );
     crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + INGRESS_PREF_OFFSET);
+    crate::linux::tc::delete_ingress_pref_best_effort(&n.underlay_dev, pref + RETURN_PREF_OFFSET);
     crate::linux::tc::delete_ingress_pref_best_effort(&n.vxlan_dev, pref + RETURN_PREF_OFFSET);
     for name in MAPS {
         let _ = fs::remove_file(pin_path(cfg, name));
@@ -1076,9 +1146,20 @@ pub fn stats(cfg: &Config) -> Result<edge_lb_common::NativeDatapathStats> {
                 .chash_bucket_unusable
                 .saturating_add(value.chash_bucket_unusable);
             total.chash_fallback = total.chash_fallback.saturating_add(value.chash_fallback);
+            total.flow_event_lost = total.flow_event_lost.saturating_add(value.flow_event_lost);
             total
         },
     ))
+}
+
+pub fn redirect_stats(cfg: &Config) -> Result<edge_lb_common::redirect::NativeRedirectStats> {
+    super::redirect::stats(&pin_path(cfg, NATIVE_REDIRECT_STATS_MAP))
+}
+
+pub fn return_redirect_stats(
+    cfg: &Config,
+) -> Result<edge_lb_common::return_redirect::ReturnRedirectStats> {
+    super::redirect::return_stats(&pin_path(cfg, NATIVE_RETURN_STATS_MAP))
 }
 
 #[cfg(test)]
@@ -1278,6 +1359,39 @@ mod tests {
                 .len(),
             first_ids.len()
         );
+    }
+
+    #[test]
+    fn native_config_uses_least_connections_only_when_listener_selects_lc() {
+        let mut file = crate::config::FileConfig::default();
+        file.network.gateway_ip = "192.0.2.10".parse().unwrap();
+        file.target_groups.push(crate::config::TargetGroup {
+            name: "targets".to_string(),
+            targets: vec![crate::config::BackendTarget {
+                address: Ipv4Addr::new(192, 0, 2, 20).into(),
+                weight: 1,
+                ..crate::config::BackendTarget::default()
+            }],
+            ..crate::config::TargetGroup::default()
+        });
+        file.listeners.push(crate::config::Listener {
+            name: "sip".to_string(),
+            port: 5060,
+            target_port: 5060,
+            target_group: "targets".to_string(),
+            protocols: vec![crate::config::Protocol::Udp],
+            select: crate::config::LbSelect::ConsistentHash,
+            ..crate::config::Listener::default()
+        });
+        let mut cfg = crate::config::Config {
+            file,
+            path: crate::config::DEFAULT_CONFIG_PATH.into(),
+        };
+
+        assert!(!super::native_config_uses_least_connections(&cfg).unwrap());
+
+        cfg.file.listeners[0].select = crate::config::LbSelect::Lc;
+        assert!(super::native_config_uses_least_connections(&cfg).unwrap());
     }
 
     #[test]
