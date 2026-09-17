@@ -48,7 +48,9 @@ gateway 的 TC direct redirect 方案见
 - `edge-lb/src/linux/nft.rs`：从 VXLAN ingress 的 DSCP 设置 ct mark；学习 UDP
   客户端地址和端口；在回程恢复 fwmark，必要时修正 UDP 源地址。
 - `edge-lb/src/linux/route.rs`：fwmark 对应的策略路由和经 gateway overlay 的默认路由。
-- `edge-lb/src/linux/return_path.rs`：应用、巡检和清理现有 nft/route 状态。
+- `edge-lb/src/linux/return_path.rs`：应用、巡检和清理现有 nft/route 状态。managed
+  apply 已记录 nft ruleset 签名；nft table、VXLAN 设备、MSS 和 return paths 未变化且表仍存在时，
+  跳过 nft table 重建，只继续由外层确保策略路由。
 - `edge-lb/src/role/backend.rs`：VXLAN 设备、peer 和本地 overlay 地址管理。
 
 ```mermaid

@@ -23,6 +23,9 @@
 - backend 在所有 IPv4 ingress 的 conntrack original 方向按已订阅 DSCP 设置 ct mark，
   不依赖 VXLAN ingress 设备、L4 协议、业务端口或 active gateway。reply 方向只恢复
   当前有效 contract 的 routing fwmark，经 VXLAN 返回 gateway；不改写业务源 IP。
+- backend managed return-path apply 必须保留上一轮 nft ruleset 签名；nft table、
+  VXLAN 设备、MSS 和 return paths 均未变化且表仍存在时，不得重建 nft 表。配置不变的
+  xDS snapshot 只能继续确保策略路由，不应清空或扰动已有 return-path 状态。
 - DSCP 是受信网络内的回程分类标记，不是身份认证。直连流量若携带相同 DSCP，也会
   被分类；部署方必须隔离这些 codepoint，不能再声称“同 DSCP 直连一定不被接管”。
   contract DSCP 必须为 1..63，多个 gateway 的 DSCP、非零 mark 和路由表不能冲突。
